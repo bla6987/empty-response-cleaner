@@ -1,0 +1,33 @@
+/* Empty Response Cleaner Extension Styles */
+
+#empty_response_cleaner_settings {
+    margin: 0;
+    padding: 0;
+}
+
+#empty_response_cleaner_settings .empty_response_cleaner_block {
+    margin: 10px 0;
+}
+
+#empty_response_cleaner_settings .checkbox_label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+}
+
+#empty_response_cleaner_settings .checkbox_label input[type="checkbox"] {
+    margin: 0;
+}
+
+#empty_response_cleaner_settings #empty_response_cleaner_clean_btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    width: 100%;
+}
+
+#empty_response_cleaner_settings #empty_response_cleaner_clean_btn i {
+    font-size: 1em;
+}
