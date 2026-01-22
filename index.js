@@ -1,13 +1,4 @@
-import {
-    eventSource,
-    event_types,
-    getContext,
-    saveChatDebounced,
-    extension_settings,
-} from '../../../../script.js';
-
 const extensionName = 'empty-response-cleaner';
-const extensionFolderPath = `scripts/extensions/third-party/${extensionName}`;
 
 // Default settings
 const defaultSettings = {
@@ -15,19 +6,32 @@ const defaultSettings = {
 };
 
 /**
+ * Get extension settings from context
+ * @returns {object} Extension settings object
+ */
+function getSettings() {
+    const { extensionSettings } = SillyTavern.getContext();
+    return extensionSettings[extensionName];
+}
+
+/**
  * Initialize extension settings
  */
 function loadSettings() {
-    if (!extension_settings[extensionName]) {
-        extension_settings[extensionName] = {};
+    const { extensionSettings, saveSettingsDebounced } = SillyTavern.getContext();
+
+    if (!extensionSettings[extensionName]) {
+        extensionSettings[extensionName] = {};
     }
 
     // Apply defaults for any missing settings
     for (const [key, value] of Object.entries(defaultSettings)) {
-        if (extension_settings[extensionName][key] === undefined) {
-            extension_settings[extensionName][key] = value;
+        if (extensionSettings[extensionName][key] === undefined) {
+            extensionSettings[extensionName][key] = value;
         }
     }
+
+    saveSettingsDebounced();
 }
 
 /**
@@ -62,13 +66,11 @@ function cleanMessageSwipes(message) {
     }
 
     // Find indices of non-empty swipes
-    const nonEmptyIndices = [];
     const nonEmptySwipes = [];
     const nonEmptySwipeInfo = [];
 
     for (let i = 0; i < message.swipes.length; i++) {
         if (!isSwipeEmpty(message.swipes[i])) {
-            nonEmptyIndices.push(i);
             nonEmptySwipes.push(message.swipes[i]);
             // Preserve swipe_info if it exists
             if (message.swipe_info && message.swipe_info[i]) {
@@ -99,7 +101,7 @@ function cleanMessageSwipes(message) {
         }
 
         // Update swipe_id to point to a valid swipe
-        // If current swipe_id is out of bounds, reset to 0
+        // If current swipe_id is out of bounds, reset to last valid swipe
         if (message.swipe_id >= message.swipes.length) {
             message.swipe_id = message.swipes.length - 1;
         }
@@ -122,8 +124,7 @@ function cleanMessageSwipes(message) {
  * @returns {boolean} - True if any changes were made
  */
 function processLastMessage(isManual = false) {
-    const context = getContext();
-    const chat = context.chat;
+    const { chat, saveChatDebounced } = SillyTavern.getContext();
 
     // Do nothing if chat is empty
     if (!chat || chat.length === 0) {
@@ -179,16 +180,21 @@ function processLastMessage(isManual = false) {
  * @param {number} messageIndex - Index of the received message
  */
 function onMessageReceived(messageIndex) {
+    const settings = getSettings();
+
     // Check if auto-clean is enabled
-    if (!extension_settings[extensionName].enabled) {
+    if (!settings || !settings.enabled) {
         return;
     }
 
-    const context = getContext();
-    const chat = context.chat;
+    const { chat } = SillyTavern.getContext();
 
     // Validate message index
-    if (messageIndex < 0 || messageIndex >= chat.length) {
+    if (typeof messageIndex !== 'number' || messageIndex < 0 || messageIndex >= chat.length) {
+        // If messageIndex is not valid, just process the last message
+        setTimeout(() => {
+            processLastMessage(false);
+        }, 100);
         return;
     }
 
@@ -209,8 +215,9 @@ function onMessageReceived(messageIndex) {
  * Handle settings toggle change
  */
 function onEnabledToggle() {
+    const { extensionSettings, saveSettingsDebounced } = SillyTavern.getContext();
     const enabled = $('#empty_response_cleaner_enabled').prop('checked');
-    extension_settings[extensionName].enabled = enabled;
+    extensionSettings[extensionName].enabled = enabled;
     saveSettingsDebounced();
 }
 
@@ -222,34 +229,11 @@ function onCleanLastMessageClick() {
 }
 
 /**
- * Save settings with debounce
- */
-const saveSettingsDebounced = debounce(() => {
-    const context = getContext();
-    if (context.saveSettingsDebounced) {
-        context.saveSettingsDebounced();
-    }
-}, 500);
-
-/**
- * Simple debounce function
- */
-function debounce(func, wait) {
-    let timeout;
-    return function executedFunction(...args) {
-        const later = () => {
-            clearTimeout(timeout);
-            func(...args);
-        };
-        clearTimeout(timeout);
-        timeout = setTimeout(later, wait);
-    };
-}
-
-/**
  * Create and inject the settings HTML
  */
 function createSettingsUI() {
+    const settings = getSettings();
+
     const settingsHtml = `
     <div id="empty_response_cleaner_settings" class="empty-response-cleaner-settings">
         <div class="inline-drawer">
@@ -279,7 +263,7 @@ function createSettingsUI() {
     $('#extensions_settings').append(settingsHtml);
 
     // Set initial state
-    $('#empty_response_cleaner_enabled').prop('checked', extension_settings[extensionName].enabled);
+    $('#empty_response_cleaner_enabled').prop('checked', settings?.enabled ?? true);
 
     // Bind event handlers
     $('#empty_response_cleaner_enabled').on('change', onEnabledToggle);
@@ -290,6 +274,8 @@ function createSettingsUI() {
  * Initialize the extension
  */
 jQuery(async () => {
+    const { eventSource, event_types } = SillyTavern.getContext();
+
     // Load settings
     loadSettings();
 
