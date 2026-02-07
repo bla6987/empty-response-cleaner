@@ -3,6 +3,7 @@ const extensionName = 'empty-response-cleaner';
 // Default settings
 const defaultSettings = {
     enabled: true,
+    autoDelete: true,
 };
 
 /**
@@ -162,6 +163,20 @@ function processLastMessage(isManual = false) {
     }
 
     if (result.messageDeleted) {
+        // Don't delete if this is the only message in the chat
+        // SillyTavern UI fails to render this correctly
+        if (chat.length <= 1) {
+            if (isManual) {
+                toastr.warning('Cannot remove the only message in chat', 'Empty Response Cleaner');
+            }
+            return false;
+        }
+
+        // Skip auto-deletion if the setting is disabled (manual clean still works)
+        if (!isManual && !getSettings()?.autoDelete) {
+            return false;
+        }
+
         // Remove the entire message from chat
         chat.splice(lastAiMessageIndex, 1);
         toastr.info('Removed empty AI response', 'Empty Response Cleaner');
@@ -222,10 +237,64 @@ function onEnabledToggle() {
 }
 
 /**
+ * Handle auto-delete toggle change
+ */
+function onAutoDeleteToggle() {
+    const { extensionSettings, saveSettingsDebounced } = SillyTavern.getContext();
+    const autoDelete = $('#empty_response_cleaner_auto_delete').prop('checked');
+    extensionSettings[extensionName].autoDelete = autoDelete;
+    saveSettingsDebounced();
+}
+
+/**
  * Handle manual clean button click
  */
 function onCleanLastMessageClick() {
     processLastMessage(true);
+}
+
+/**
+ * Delete the last AI message from the chat regardless of content
+ * @returns {boolean} - True if a message was deleted
+ */
+function deleteLastMessage() {
+    const { chat, saveChatDebounced } = SillyTavern.getContext();
+
+    if (!chat || chat.length === 0) {
+        toastr.warning('Chat is empty', 'Empty Response Cleaner');
+        return false;
+    }
+
+    // Find the last AI message
+    let lastAiMessageIndex = -1;
+    for (let i = chat.length - 1; i >= 0; i--) {
+        if (chat[i].is_user === false) {
+            lastAiMessageIndex = i;
+            break;
+        }
+    }
+
+    if (lastAiMessageIndex === -1) {
+        toastr.warning('No AI message found', 'Empty Response Cleaner');
+        return false;
+    }
+
+    if (chat.length <= 1) {
+        toastr.warning('Cannot remove the only message in chat', 'Empty Response Cleaner');
+        return false;
+    }
+
+    chat.splice(lastAiMessageIndex, 1);
+    saveChatDebounced();
+    toastr.info('Deleted last AI message', 'Empty Response Cleaner');
+    return true;
+}
+
+/**
+ * Handle manual delete button click
+ */
+function onDeleteLastMessageClick() {
+    deleteLastMessage();
 }
 
 /**
@@ -249,9 +318,21 @@ function createSettingsUI() {
                     </label>
                 </div>
                 <div class="empty_response_cleaner_block">
+                    <label class="checkbox_label" for="empty_response_cleaner_auto_delete">
+                        <input type="checkbox" id="empty_response_cleaner_auto_delete" />
+                        <span>Automatically delete empty responses</span>
+                    </label>
+                </div>
+                <div class="empty_response_cleaner_block">
                     <div class="menu_button menu_button_icon" id="empty_response_cleaner_clean_btn">
                         <i class="fa-solid fa-broom"></i>
                         <span>Clean Last Message</span>
+                    </div>
+                </div>
+                <div class="empty_response_cleaner_block">
+                    <div class="menu_button menu_button_icon" id="empty_response_cleaner_delete_btn">
+                        <i class="fa-solid fa-trash"></i>
+                        <span>Delete Last AI Message</span>
                     </div>
                 </div>
                 <hr class="sysHR" />
@@ -264,10 +345,13 @@ function createSettingsUI() {
 
     // Set initial state
     $('#empty_response_cleaner_enabled').prop('checked', settings?.enabled ?? true);
+    $('#empty_response_cleaner_auto_delete').prop('checked', settings?.autoDelete ?? true);
 
     // Bind event handlers
     $('#empty_response_cleaner_enabled').on('change', onEnabledToggle);
+    $('#empty_response_cleaner_auto_delete').on('change', onAutoDeleteToggle);
     $('#empty_response_cleaner_clean_btn').on('click', onCleanLastMessageClick);
+    $('#empty_response_cleaner_delete_btn').on('click', onDeleteLastMessageClick);
 }
 
 /**
