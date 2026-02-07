@@ -152,6 +152,11 @@ function processLastMessage(isManual = false) {
         return false;
     }
 
+    // When auto-delete is disabled, skip all automatic cleanup/deletion.
+    if (!isManual && !getSettings()?.autoDelete) {
+        return false;
+    }
+
     const message = chat[lastAiMessageIndex];
     const result = cleanMessageSwipes(message);
 
@@ -169,11 +174,6 @@ function processLastMessage(isManual = false) {
             if (isManual) {
                 toastr.warning('Cannot remove the only message in chat', 'Empty Response Cleaner');
             }
-            return false;
-        }
-
-        // Skip auto-deletion if the setting is disabled (manual clean still works)
-        if (!isManual && !getSettings()?.autoDelete) {
             return false;
         }
 
@@ -320,7 +320,7 @@ function createSettingsUI() {
                 <div class="empty_response_cleaner_block">
                     <label class="checkbox_label" for="empty_response_cleaner_auto_delete">
                         <input type="checkbox" id="empty_response_cleaner_auto_delete" />
-                        <span>Automatically delete empty responses</span>
+                        <span>Automatically clean empty responses (swipes + fully empty messages)</span>
                     </label>
                 </div>
                 <div class="empty_response_cleaner_block">
