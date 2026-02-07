@@ -6,6 +6,8 @@ const defaultSettings = {
     autoDelete: true,
 };
 
+let isProcessing = false;
+
 /**
  * Get extension settings from context
  * @returns {object} Extension settings object
@@ -44,13 +46,52 @@ function isSwipeEmpty(swipe) {
     return !swipe || swipe.trim() === '';
 }
 
+function log(...args) {
+    console.debug(`[${extensionName}]`, ...args);
+}
+
 /**
- * Clean empty swipes from a message
+ * Get the SillyTavern deleteMessage API from context
+ * @returns {Function|null}
+ */
+function getDeleteMessageApi() {
+    const { deleteMessage } = SillyTavern.getContext();
+    return typeof deleteMessage === 'function' ? deleteMessage : null;
+}
+
+/**
+ * Delete a whole message or a single swipe via official ST API.
+ * Returns false if API is unavailable or the operation fails.
+ * @param {number} messageIndex
+ * @param {number|undefined} swipeIndex
+ * @returns {Promise<boolean>}
+ */
+async function deleteViaApi(messageIndex, swipeIndex = undefined) {
+    const deleteMessage = getDeleteMessageApi();
+    if (!deleteMessage) {
+        toastr.warning('Cleanup skipped: compatible delete API not available', 'Empty Response Cleaner');
+        console.warn(`[${extensionName}] deleteMessage API unavailable; skipping cleanup`);
+        return false;
+    }
+
+    try {
+        await deleteMessage(messageIndex, swipeIndex, false);
+        return true;
+    } catch (error) {
+        console.warn(`[${extensionName}] delete API call failed`, { messageIndex, swipeIndex, error });
+        toastr.warning('Cleanup skipped: delete API failed', 'Empty Response Cleaner');
+        return false;
+    }
+}
+
+/**
+ * Analyze empty swipes from a message without mutating it
  * @param {object} message - The message object to clean
  * @returns {object} - Result with information about what was cleaned
  */
 function cleanMessageSwipes(message) {
     const result = {
+        emptySwipeIndexes: [],
         removedSwipes: 0,
         messageDeleted: false,
         modified: false,
@@ -66,54 +107,24 @@ function cleanMessageSwipes(message) {
         return result;
     }
 
-    // Find indices of non-empty swipes
-    const nonEmptySwipes = [];
-    const nonEmptySwipeInfo = [];
-
     for (let i = 0; i < message.swipes.length; i++) {
-        if (!isSwipeEmpty(message.swipes[i])) {
-            nonEmptySwipes.push(message.swipes[i]);
-            // Preserve swipe_info if it exists
-            if (message.swipe_info && message.swipe_info[i]) {
-                nonEmptySwipeInfo.push(message.swipe_info[i]);
-            }
+        if (isSwipeEmpty(message.swipes[i])) {
+            result.emptySwipeIndexes.push(i);
         }
     }
 
-    result.removedSwipes = message.swipes.length - nonEmptySwipes.length;
+    result.removedSwipes = result.emptySwipeIndexes.length;
 
-    // If all swipes are empty, mark for deletion
-    if (nonEmptySwipes.length === 0) {
-        result.messageDeleted = true;
-        result.modified = true;
+    // If no empty swipes, no work to do
+    if (result.removedSwipes === 0) {
         return result;
     }
 
-    // If some swipes were removed, update the message
-    if (result.removedSwipes > 0) {
-        result.modified = true;
+    result.modified = true;
 
-        // Update swipes array
-        message.swipes = nonEmptySwipes;
-
-        // Update swipe_info if it exists
-        if (message.swipe_info) {
-            message.swipe_info = nonEmptySwipeInfo;
-        }
-
-        // Update swipe_id to point to a valid swipe
-        // If current swipe_id is out of bounds, reset to last valid swipe
-        if (message.swipe_id >= message.swipes.length) {
-            message.swipe_id = message.swipes.length - 1;
-        }
-
-        // Ensure swipe_id is at least 0
-        if (message.swipe_id < 0) {
-            message.swipe_id = 0;
-        }
-
-        // Update 'mes' to reflect the current active swipe
-        message.mes = message.swipes[message.swipe_id];
+    // If all swipes are empty, mark for full message deletion
+    if (result.removedSwipes === message.swipes.length) {
+        result.messageDeleted = true;
     }
 
     return result;
@@ -122,10 +133,10 @@ function cleanMessageSwipes(message) {
 /**
  * Process the last AI message and clean empty swipes
  * @param {boolean} isManual - Whether this is a manual trigger
- * @returns {boolean} - True if any changes were made
+ * @returns {Promise<boolean>} - True if any changes were made
  */
-function processLastMessage(isManual = false) {
-    const { chat, saveChatDebounced } = SillyTavern.getContext();
+async function processLastMessage(isManual = false) {
+    const { chat } = SillyTavern.getContext();
 
     // Do nothing if chat is empty
     if (!chat || chat.length === 0) {
@@ -177,17 +188,59 @@ function processLastMessage(isManual = false) {
             return false;
         }
 
-        // Remove the entire message from chat
-        chat.splice(lastAiMessageIndex, 1);
+        const deleted = await deleteViaApi(lastAiMessageIndex);
+        if (!deleted) {
+            return false;
+        }
+
+        log('Deleted empty AI message via deleteMessage API', { messageIndex: lastAiMessageIndex });
         toastr.info('Removed empty AI response', 'Empty Response Cleaner');
-    } else if (result.removedSwipes > 0) {
-        toastr.info(`Removed ${result.removedSwipes} empty swipe${result.removedSwipes > 1 ? 's' : ''}`, 'Empty Response Cleaner');
+        return true;
     }
 
-    // Persist changes
-    saveChatDebounced();
+    let removedSwipes = 0;
+    const emptyIndexesDescending = [...result.emptySwipeIndexes].sort((a, b) => b - a);
 
-    return true;
+    // Delete each empty swipe through API so ST emits MESSAGE_SWIPE_DELETED.
+    for (const swipeIndex of emptyIndexesDescending) {
+        const deleted = await deleteViaApi(lastAiMessageIndex, swipeIndex);
+        if (deleted) {
+            removedSwipes++;
+            log('Deleted empty swipe via deleteMessage API', {
+                messageIndex: lastAiMessageIndex,
+                swipeIndex,
+            });
+        }
+    }
+
+    if (removedSwipes > 0) {
+        toastr.info(`Removed ${removedSwipes} empty swipe${removedSwipes > 1 ? 's' : ''}`, 'Empty Response Cleaner');
+        return true;
+    }
+
+    if (isManual) {
+        toastr.warning('Unable to remove empty swipes', 'Empty Response Cleaner');
+    }
+
+    return false;
+}
+
+/**
+ * Prevent overlapping cleanup runs from rapid event bursts.
+ * @param {boolean} isManual
+ * @returns {Promise<boolean>}
+ */
+async function processLastMessageLocked(isManual = false) {
+    if (isProcessing) {
+        return false;
+    }
+
+    isProcessing = true;
+    try {
+        return await processLastMessage(isManual);
+    } finally {
+        isProcessing = false;
+    }
 }
 
 /**
@@ -208,7 +261,9 @@ function onMessageReceived(messageIndex) {
     if (typeof messageIndex !== 'number' || messageIndex < 0 || messageIndex >= chat.length) {
         // If messageIndex is not valid, just process the last message
         setTimeout(() => {
-            processLastMessage(false);
+            processLastMessageLocked(false).catch((error) => {
+                console.warn(`[${extensionName}] Auto-clean failed`, error);
+            });
         }, 100);
         return;
     }
@@ -222,7 +277,9 @@ function onMessageReceived(messageIndex) {
 
     // Small delay to ensure message is fully processed
     setTimeout(() => {
-        processLastMessage(false);
+        processLastMessageLocked(false).catch((error) => {
+            console.warn(`[${extensionName}] Auto-clean failed`, error);
+        });
     }, 100);
 }
 
@@ -249,16 +306,16 @@ function onAutoDeleteToggle() {
 /**
  * Handle manual clean button click
  */
-function onCleanLastMessageClick() {
-    processLastMessage(true);
+async function onCleanLastMessageClick() {
+    await processLastMessageLocked(true);
 }
 
 /**
  * Delete the last AI message from the chat regardless of content
- * @returns {boolean} - True if a message was deleted
+ * @returns {Promise<boolean>} - True if a message was deleted
  */
-function deleteLastMessage() {
-    const { chat, saveChatDebounced } = SillyTavern.getContext();
+async function deleteLastMessage() {
+    const { chat } = SillyTavern.getContext();
 
     if (!chat || chat.length === 0) {
         toastr.warning('Chat is empty', 'Empty Response Cleaner');
@@ -284,8 +341,12 @@ function deleteLastMessage() {
         return false;
     }
 
-    chat.splice(lastAiMessageIndex, 1);
-    saveChatDebounced();
+    const deleted = await deleteViaApi(lastAiMessageIndex);
+    if (!deleted) {
+        return false;
+    }
+
+    log('Deleted last AI message via deleteMessage API', { messageIndex: lastAiMessageIndex });
     toastr.info('Deleted last AI message', 'Empty Response Cleaner');
     return true;
 }
@@ -293,8 +354,8 @@ function deleteLastMessage() {
 /**
  * Handle manual delete button click
  */
-function onDeleteLastMessageClick() {
-    deleteLastMessage();
+async function onDeleteLastMessageClick() {
+    await deleteLastMessage();
 }
 
 /**
