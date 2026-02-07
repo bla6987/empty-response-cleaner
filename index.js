@@ -7,6 +7,10 @@ const defaultSettings = {
 };
 
 let isProcessing = false;
+let lastScheduledCleanup = {
+    messageIndex: null,
+    at: 0,
+};
 
 /**
  * Get extension settings from context
@@ -48,6 +52,81 @@ function isSwipeEmpty(swipe) {
 
 function log(...args) {
     console.debug(`[${extensionName}]`, ...args);
+}
+
+/**
+ * Wait one UI tick so DOM/state updates from deleteMessage settle first.
+ * @returns {Promise<void>}
+ */
+async function waitForUiTick() {
+    await Promise.resolve();
+
+    if (typeof requestAnimationFrame === 'function') {
+        await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+        return;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+/**
+ * Clamp swipe_id and force the visible message content to the active swipe,
+ * then re-render only that message block.
+ * @param {number} messageIndex
+ * @returns {Promise<boolean>}
+ */
+async function repairAndRerenderMessage(messageIndex) {
+    const { chat, updateMessageBlock, swipe } = SillyTavern.getContext();
+    const canRerender = typeof updateMessageBlock === 'function';
+
+    if (!chat || messageIndex < 0 || messageIndex >= chat.length) {
+        return false;
+    }
+
+    const message = chat[messageIndex];
+    if (!message || message.is_user === true) {
+        return false;
+    }
+
+    if (Array.isArray(message.swipes) && message.swipes.length > 0) {
+        const currentSwipeId = Number.isInteger(message.swipe_id) ? message.swipe_id : 0;
+        const clampedSwipeId = Math.max(0, Math.min(currentSwipeId, message.swipes.length - 1));
+        message.swipe_id = clampedSwipeId;
+
+        const activeSwipe = message.swipes[clampedSwipeId];
+        message.mes = typeof activeSwipe === 'string' ? activeSwipe : String(activeSwipe ?? '');
+    }
+
+    await waitForUiTick();
+
+    if (canRerender) {
+        try {
+            updateMessageBlock(messageIndex, message, { rerenderMessage: true });
+        } catch (error) {
+            console.warn(`[${extensionName}] updateMessageBlock failed`, { messageIndex, error });
+        }
+    }
+
+    if (swipe && typeof swipe.refresh === 'function') {
+        try {
+            swipe.refresh(true, false);
+        } catch {
+            try {
+                swipe.refresh();
+            } catch (error) {
+                console.warn(`[${extensionName}] swipe.refresh failed`, { messageIndex, error });
+            }
+        }
+    }
+
+    if (canRerender) {
+        log('Repaired and re-rendered message after swipe cleanup', {
+            messageIndex,
+            swipeId: message.swipe_id,
+        });
+    }
+
+    return canRerender;
 }
 
 /**
@@ -210,6 +289,9 @@ async function processLastMessage(isManual = false) {
                 messageIndex: lastAiMessageIndex,
                 swipeIndex,
             });
+
+            // Keep UI in sync immediately after each deletion.
+            await repairAndRerenderMessage(lastAiMessageIndex);
         }
     }
 
@@ -244,10 +326,37 @@ async function processLastMessageLocked(isManual = false) {
 }
 
 /**
- * Handler for MESSAGE_RECEIVED event
+ * Schedule automatic cleanup with short dedupe window to avoid
+ * duplicate runs from nearby events.
+ * @param {number} messageIndex
+ * @returns {void}
+ */
+function scheduleAutoCleanup(messageIndex) {
+    const now = Date.now();
+    const dedupeWindowMs = 500;
+
+    if (lastScheduledCleanup.messageIndex === messageIndex && (now - lastScheduledCleanup.at) < dedupeWindowMs) {
+        return;
+    }
+
+    lastScheduledCleanup = {
+        messageIndex,
+        at: now,
+    };
+
+    setTimeout(() => {
+        processLastMessageLocked(false).catch((error) => {
+            console.warn(`[${extensionName}] Auto-clean failed`, error);
+        });
+    }, 50);
+}
+
+/**
+ * Handler for message-rendered lifecycle event.
+ * This runs after the UI has rendered, preventing stale/blank message text.
  * @param {number} messageIndex - Index of the received message
  */
-function onMessageReceived(messageIndex) {
+function onCharacterMessageRendered(messageIndex) {
     const settings = getSettings();
 
     // Check if auto-clean is enabled
@@ -259,12 +368,8 @@ function onMessageReceived(messageIndex) {
 
     // Validate message index
     if (typeof messageIndex !== 'number' || messageIndex < 0 || messageIndex >= chat.length) {
-        // If messageIndex is not valid, just process the last message
-        setTimeout(() => {
-            processLastMessageLocked(false).catch((error) => {
-                console.warn(`[${extensionName}] Auto-clean failed`, error);
-            });
-        }, 100);
+        // If messageIndex is not valid, just process the last message.
+        scheduleAutoCleanup(-1);
         return;
     }
 
@@ -275,12 +380,7 @@ function onMessageReceived(messageIndex) {
         return;
     }
 
-    // Small delay to ensure message is fully processed
-    setTimeout(() => {
-        processLastMessageLocked(false).catch((error) => {
-            console.warn(`[${extensionName}] Auto-clean failed`, error);
-        });
-    }, 100);
+    scheduleAutoCleanup(messageIndex);
 }
 
 /**
@@ -427,8 +527,13 @@ jQuery(async () => {
     // Create settings UI
     createSettingsUI();
 
-    // Register event listener for MESSAGE_RECEIVED
-    eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
+    // Prefer post-render event so cleanup happens after the visible message is built.
+    if (event_types?.CHARACTER_MESSAGE_RENDERED) {
+        eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, onCharacterMessageRendered);
+    } else {
+        // Fallback for older ST versions.
+        eventSource.on(event_types.MESSAGE_RECEIVED, onCharacterMessageRendered);
+    }
 
     console.log(`[${extensionName}] Extension loaded`);
 });
