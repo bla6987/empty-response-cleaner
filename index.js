@@ -12,6 +12,14 @@ let lastScheduledCleanup = {
     at: 0,
 };
 
+// Module-level timer ID so we can clear any pending timer before scheduling a new one
+let autoCleanupTimerId = null;
+
+// Module-level event listener references so they can be removed later
+let boundOnCharacterMessageRendered = null;
+let boundOnMessageReceived = null;
+let usingCharacterMessageRenderedEvent = false;
+
 /**
  * Get extension settings from context
  * @returns {object} Extension settings object
@@ -50,8 +58,12 @@ function isSwipeEmpty(swipe) {
     return !swipe || swipe.trim() === '';
 }
 
+const DEBUG = false;
+
 function log(...args) {
-    console.debug(`[${extensionName}]`, ...args);
+    if (DEBUG) {
+        console.debug(`[${extensionName}]`, ...args);
+    }
 }
 
 /**
@@ -326,8 +338,31 @@ async function processLastMessageLocked(isManual = false) {
 }
 
 /**
+ * Cancel any pending auto-cleanup timer and remove registered event listeners.
+ * Safe to call multiple times.
+ */
+function cleanupExtension() {
+    if (autoCleanupTimerId !== null) {
+        clearTimeout(autoCleanupTimerId);
+        autoCleanupTimerId = null;
+    }
+
+    const { eventSource, event_types } = SillyTavern.getContext();
+
+    if (usingCharacterMessageRenderedEvent && boundOnCharacterMessageRendered && event_types?.CHARACTER_MESSAGE_RENDERED) {
+        eventSource.removeListener(event_types.CHARACTER_MESSAGE_RENDERED, boundOnCharacterMessageRendered);
+    } else if (boundOnMessageReceived && event_types?.MESSAGE_RECEIVED) {
+        eventSource.removeListener(event_types.MESSAGE_RECEIVED, boundOnMessageReceived);
+    }
+
+    boundOnCharacterMessageRendered = null;
+    boundOnMessageReceived = null;
+}
+
+/**
  * Schedule automatic cleanup with short dedupe window to avoid
  * duplicate runs from nearby events.
+ * Only one timer is ever pending at a time.
  * @param {number} messageIndex
  * @returns {void}
  */
@@ -344,7 +379,13 @@ function scheduleAutoCleanup(messageIndex) {
         at: now,
     };
 
-    setTimeout(() => {
+    // Cancel any previously pending timer before scheduling a new one
+    if (autoCleanupTimerId !== null) {
+        clearTimeout(autoCleanupTimerId);
+    }
+
+    autoCleanupTimerId = setTimeout(() => {
+        autoCleanupTimerId = null;
         processLastMessageLocked(false).catch((error) => {
             console.warn(`[${extensionName}] Auto-clean failed`, error);
         });
@@ -384,6 +425,27 @@ function onCharacterMessageRendered(messageIndex) {
 }
 
 /**
+ * Register event listeners for message rendering events.
+ * Cleans up existing listeners first to avoid duplicates.
+ */
+function registerEventListeners() {
+    const { eventSource, event_types } = SillyTavern.getContext();
+
+    // Clean up any existing listeners before re-registering
+    cleanupExtension();
+
+    if (event_types?.CHARACTER_MESSAGE_RENDERED) {
+        boundOnCharacterMessageRendered = onCharacterMessageRendered;
+        usingCharacterMessageRenderedEvent = true;
+        eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, boundOnCharacterMessageRendered);
+    } else {
+        boundOnMessageReceived = onCharacterMessageRendered;
+        usingCharacterMessageRenderedEvent = false;
+        eventSource.on(event_types.MESSAGE_RECEIVED, boundOnMessageReceived);
+    }
+}
+
+/**
  * Handle settings toggle change
  */
 function onEnabledToggle() {
@@ -391,6 +453,14 @@ function onEnabledToggle() {
     const enabled = $('#empty_response_cleaner_enabled').prop('checked');
     extensionSettings[extensionName].enabled = enabled;
     saveSettingsDebounced();
+
+    if (!enabled) {
+        // Cancel pending timer and remove listeners when extension is disabled
+        cleanupExtension();
+    } else {
+        // Re-register listeners when extension is re-enabled
+        registerEventListeners();
+    }
 }
 
 /**
@@ -527,13 +597,19 @@ jQuery(async () => {
     // Create settings UI
     createSettingsUI();
 
-    // Prefer post-render event so cleanup happens after the visible message is built.
-    if (event_types?.CHARACTER_MESSAGE_RENDERED) {
-        eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, onCharacterMessageRendered);
-    } else {
-        // Fallback for older ST versions.
-        eventSource.on(event_types.MESSAGE_RECEIVED, onCharacterMessageRendered);
+    // Cancel pending timers when chat changes to avoid stale cleanups firing
+    if (event_types?.CHAT_CHANGED) {
+        eventSource.on(event_types.CHAT_CHANGED, () => {
+            if (autoCleanupTimerId !== null) {
+                clearTimeout(autoCleanupTimerId);
+                autoCleanupTimerId = null;
+            }
+            lastScheduledCleanup = { messageIndex: null, at: 0 };
+        });
     }
+
+    // Prefer post-render event so cleanup happens after the visible message is built.
+    registerEventListeners();
 
     console.log(`[${extensionName}] Extension loaded`);
 });
