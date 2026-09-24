@@ -4,6 +4,9 @@ const extensionName = 'empty-response-cleaner';
 const defaultSettings = {
     enabled: true,
     autoDelete: true,
+    retryOnApiError: true,
+    maxRetries: 3,
+    retryDelayMs: 2000,
 };
 
 let isProcessing = false;
@@ -18,6 +21,9 @@ let autoCleanupTimerId = null;
 // Module-level event listener references so they can be removed later
 let boundOnCharacterMessageRendered = null;
 let boundOnMessageReceived = null;
+let boundOnGenerationStarted = null;
+let boundOnGenerationStopped = null;
+let boundOnChatChanged = null;
 let usingCharacterMessageRenderedEvent = false;
 
 /**
@@ -64,6 +70,627 @@ function log(...args) {
     if (DEBUG) {
         console.debug(`[${extensionName}]`, ...args);
     }
+}
+
+
+const GENERATION_ENDPOINTS = new Set([
+    '/api/backends/chat-completions/generate',
+    '/api/backends/text-completions/generate',
+    '/api/backends/kobold/generate',
+    '/api/novelai/generate',
+]);
+
+const RETRYABLE_HTTP_STATUSES = new Set([408, 425, 429]);
+const FETCH_PATCH_KEY = '__empty_response_cleaner_fetch_patch__';
+const MAX_BACKOFF_MS = 30_000;
+const MAX_RETRY_AFTER_MS = 5 * 60_000;
+
+let generationSequence = 0;
+let generationStack = [];
+let retryState = {
+    attempts: 0,
+    timerId: null,
+    scheduledForGenerationId: null,
+    chatKey: null,
+    launching: false,
+};
+
+function clampNumber(value, min, max, fallback) {
+    const numericValue = Number(value);
+    if (!Number.isFinite(numericValue)) {
+        return fallback;
+    }
+    return Math.min(max, Math.max(min, numericValue));
+}
+
+function getMaxRetries() {
+    return Math.round(clampNumber(getSettings()?.maxRetries, 0, 10, defaultSettings.maxRetries));
+}
+
+function getRetryDelayMs() {
+    return Math.round(clampNumber(getSettings()?.retryDelayMs, 250, 60_000, defaultSettings.retryDelayMs));
+}
+
+function getCurrentChatKey() {
+    const context = SillyTavern.getContext();
+    const chatId = context.chatId ?? '';
+
+    if (context.groupId !== undefined && context.groupId !== null) {
+        return 'group:' + String(context.groupId) + ':' + String(chatId);
+    }
+
+    return 'character:' + String(context.characterId ?? '') + ':' + String(chatId);
+}
+
+function copyRetryOptions(options) {
+    if (!options || typeof options !== 'object') {
+        return {};
+    }
+
+    const retryOptions = { ...options };
+    // Never reuse an AbortSignal from the failed request.
+    delete retryOptions.signal;
+    return retryOptions;
+}
+
+function isRetryableGenerationType(type) {
+    return [undefined, null, 'normal', 'regenerate', 'swipe', 'continue', 'impersonate'].includes(type);
+}
+
+function cancelPendingRetry(resetAttempts = false) {
+    if (retryState.timerId !== null) {
+        clearTimeout(retryState.timerId);
+        retryState.timerId = null;
+    }
+
+    retryState.scheduledForGenerationId = null;
+
+    if (resetAttempts) {
+        retryState.attempts = 0;
+        retryState.chatKey = null;
+    }
+}
+
+function onGenerationStarted(type, options = {}, dryRun = false) {
+    if (dryRun) {
+        return;
+    }
+
+    const normalizedType = type ?? 'normal';
+    const generation = {
+        id: ++generationSequence,
+        type: normalizedType,
+        options: copyRetryOptions(options),
+        chatKey: getCurrentChatKey(),
+        retryable: isRetryableGenerationType(type) && normalizedType !== 'quiet',
+    };
+
+    // A new foreground generation supersedes stale generation contexts.
+    // If the user started it manually, it also starts a fresh retry budget.
+    if (normalizedType !== 'quiet') {
+        if (!retryState.launching) {
+            cancelPendingRetry(true);
+            retryState.chatKey = generation.chatKey;
+        }
+        generationStack = [];
+    }
+
+    generationStack.push(generation);
+    log('Generation started', {
+        id: generation.id,
+        type: generation.type,
+        retryable: generation.retryable,
+        autoRetry: retryState.launching,
+    });
+}
+
+function onGenerationStopped() {
+    generationStack = [];
+    cancelPendingRetry(true);
+    log('Generation stopped; pending API retry cancelled');
+}
+
+function onChatChangedForExtension() {
+    if (autoCleanupTimerId !== null) {
+        clearTimeout(autoCleanupTimerId);
+        autoCleanupTimerId = null;
+    }
+
+    lastScheduledCleanup = { messageIndex: null, at: 0 };
+    generationStack = [];
+    cancelPendingRetry(true);
+}
+
+function getActiveGeneration() {
+    return generationStack.length ? generationStack[generationStack.length - 1] : null;
+}
+
+function consumeGeneration(generationId) {
+    const index = generationStack.findIndex((item) => item.id === generationId);
+    if (index !== -1) {
+        generationStack.splice(index, 1);
+    }
+}
+
+function getRequestPath(input) {
+    try {
+        let rawUrl = '';
+
+        if (typeof input === 'string') {
+            rawUrl = input;
+        } else if (typeof URL !== 'undefined' && input instanceof URL) {
+            rawUrl = input.href;
+        } else if (input && typeof input.url === 'string') {
+            rawUrl = input.url;
+        }
+
+        if (!rawUrl) {
+            return '';
+        }
+
+        return new URL(rawUrl, window.location.href).pathname;
+    } catch {
+        return '';
+    }
+}
+
+function parseRequestBody(init) {
+    if (typeof init?.body !== 'string') {
+        return null;
+    }
+
+    try {
+        return JSON.parse(init.body);
+    } catch {
+        return null;
+    }
+}
+
+function getGenerationRequestInfo(input, init) {
+    const path = getRequestPath(input);
+    if (!GENERATION_ENDPOINTS.has(path)) {
+        return null;
+    }
+
+    const body = parseRequestBody(init);
+    return {
+        path,
+        streaming: body?.stream === true || body?.streaming === true,
+    };
+}
+
+function isAbortError(error) {
+    const name = String(error?.name ?? '');
+    const message = String(error?.message ?? error ?? '');
+    return name === 'AbortError' || /\babort(?:ed|ing)?\b/i.test(message);
+}
+
+function isRetryableHttpStatus(status) {
+    const code = Number(status);
+    return RETRYABLE_HTTP_STATUSES.has(code) || (code >= 500 && code <= 599);
+}
+
+function extractStatusCode(payload) {
+    const candidates = [
+        payload?.status,
+        payload?.status_code,
+        payload?.statusCode,
+        payload?.code,
+        payload?.error?.status,
+        payload?.error?.status_code,
+        payload?.error?.statusCode,
+        payload?.error?.code,
+        payload?.detail?.status,
+        payload?.detail?.status_code,
+        payload?.detail?.error?.status,
+        payload?.detail?.error?.code,
+    ];
+
+    for (const value of candidates) {
+        if (typeof value === 'number' && Number.isInteger(value) && value >= 100 && value <= 599) {
+            return value;
+        }
+
+        if (typeof value === 'string' && /^\d{3}$/.test(value.trim())) {
+            const parsed = Number(value.trim());
+            if (parsed >= 100 && parsed <= 599) {
+                return parsed;
+            }
+        }
+    }
+
+    return null;
+}
+
+function stringifyErrorValue(value) {
+    if (value === undefined || value === null || value === false) {
+        return '';
+    }
+
+    if (typeof value === 'string') {
+        return value;
+    }
+
+    try {
+        return JSON.stringify(value);
+    } catch {
+        return String(value);
+    }
+}
+
+function getErrorText(payload, rawText = '') {
+    const pieces = [
+        stringifyErrorValue(payload?.error),
+        stringifyErrorValue(payload?.detail?.error),
+        stringifyErrorValue(payload?.detail),
+        stringifyErrorValue(payload?.message),
+        stringifyErrorValue(payload?.response),
+    ].filter(Boolean);
+
+    const combined = pieces.join(' ');
+    return (combined || rawText || '').slice(0, 4000);
+}
+
+function payloadContainsError(payload) {
+    return Boolean(
+        payload
+        && (
+            payload.error
+            || payload?.detail?.error
+            || payload.quota_error === true
+        )
+    );
+}
+
+const NON_RETRYABLE_ERROR_PATTERN = /insufficient[_\s-]?quota|quota\s+(?:exceeded|exhausted)|billing|invalid[_\s-]?(?:api[_\s-]?)?key|authentication|unauthori[sz]ed|forbidden|permission\s+denied|invalid[_\s-]?request|bad\s+request|context\s+(?:length|window)|maximum\s+context|content\s+(?:policy|moderation)|moderation|model\s+.*not\s+found/i;
+const TRANSIENT_ERROR_PATTERN = /\b429\b|rate[\s_-]*limit|too\s+many\s+requests|temporar(?:y|ily)|overload(?:ed)?|capacity|server\s+busy|try\s+again|timeout|timed\s+out|connection\s+(?:reset|refused|closed)|econnreset|econnrefused|socket\s+hang\s+up|bad\s+gateway|service\s+unavailable|gateway\s+timeout|\b50[0234]\b/i;
+
+function classifyGenerationResponse(response, payload, rawText) {
+    const hasPayloadError = payloadContainsError(payload);
+    const isError = !response.ok || hasPayloadError;
+
+    if (!isError) {
+        return { isError: false, retryable: false };
+    }
+
+    const errorText = getErrorText(payload, rawText);
+    const explicitStatus = extractStatusCode(payload);
+    const status = explicitStatus ?? response.status;
+
+    if (payload?.quota_error === true || NON_RETRYABLE_ERROR_PATTERN.test(errorText)) {
+        return {
+            isError: true,
+            retryable: false,
+            status,
+            label: errorText || ('HTTP ' + String(status)),
+        };
+    }
+
+    if (isRetryableHttpStatus(explicitStatus) || isRetryableHttpStatus(response.status) || TRANSIENT_ERROR_PATTERN.test(errorText)) {
+        return {
+            isError: true,
+            retryable: true,
+            status,
+            label: errorText || ('HTTP ' + String(status)),
+        };
+    }
+
+    return {
+        isError: true,
+        retryable: false,
+        status,
+        label: errorText || ('HTTP ' + String(status)),
+    };
+}
+
+function parseRetryAfterMs(response) {
+    const value = response?.headers?.get?.('Retry-After');
+    if (!value) {
+        return null;
+    }
+
+    const seconds = Number(value);
+    if (Number.isFinite(seconds)) {
+        return Math.min(MAX_RETRY_AFTER_MS, Math.max(0, seconds * 1000));
+    }
+
+    const date = Date.parse(value);
+    if (Number.isFinite(date)) {
+        return Math.min(MAX_RETRY_AFTER_MS, Math.max(0, date - Date.now()));
+    }
+
+    return null;
+}
+
+function computeRetryDelayMs(attempt, retryAfterMs = null) {
+    const exponentialDelay = Math.min(
+        MAX_BACKOFF_MS,
+        getRetryDelayMs() * Math.pow(2, Math.max(0, attempt - 1)),
+    );
+
+    if (Number.isFinite(retryAfterMs)) {
+        return Math.max(exponentialDelay, retryAfterMs);
+    }
+
+    return exponentialDelay;
+}
+
+function formatRetryDelay(ms) {
+    if (ms < 1000) {
+        return String(Math.round(ms)) + ' ms';
+    }
+
+    const seconds = ms / 1000;
+    return (Number.isInteger(seconds) ? String(seconds) : seconds.toFixed(1)) + ' s';
+}
+
+function getRetryGenerationType(generation) {
+    const context = SillyTavern.getContext();
+    const originalType = generation.type ?? 'normal';
+
+    // A failed normal generation has usually already saved the user's message.
+    // "regenerate" safely retries from that user turn without sending an empty
+    // or send_if_empty user message.
+    if (originalType === 'normal') {
+        const lastMessage = context.chat?.[context.chat.length - 1];
+        if (lastMessage?.is_user === true) {
+            return 'regenerate';
+        }
+    }
+
+    return originalType;
+}
+
+function markSuccessfulGenerationRequest(generation) {
+    consumeGeneration(generation.id);
+
+    if (retryState.attempts > 0 && retryState.chatKey === generation.chatKey) {
+        log('API retry succeeded', { attempts: retryState.attempts });
+        cancelPendingRetry(true);
+    }
+}
+
+function markNonRetryableGenerationFailure(generation) {
+    consumeGeneration(generation.id);
+
+    if (retryState.chatKey === generation.chatKey) {
+        cancelPendingRetry(true);
+    }
+}
+
+function scheduleGenerationRetry(generation, failure) {
+    const settings = getSettings();
+
+    if (!settings?.enabled || !settings?.retryOnApiError || !generation?.retryable) {
+        return;
+    }
+
+    if (getCurrentChatKey() !== generation.chatKey) {
+        cancelPendingRetry(true);
+        return;
+    }
+
+    if (retryState.scheduledForGenerationId === generation.id) {
+        return;
+    }
+
+    if (retryState.chatKey && retryState.chatKey !== generation.chatKey) {
+        cancelPendingRetry(true);
+    }
+    retryState.chatKey = generation.chatKey;
+
+    const maxRetries = getMaxRetries();
+    if (maxRetries <= 0) {
+        return;
+    }
+
+    if (retryState.attempts >= maxRetries) {
+        retryState.scheduledForGenerationId = generation.id;
+        toastr.warning(
+            'Automatic API retry limit reached (' + String(maxRetries) + ').',
+            'Empty Response Cleaner',
+            { timeOut: 8000 },
+        );
+        return;
+    }
+
+    retryState.attempts += 1;
+    const attempt = retryState.attempts;
+    const delayMs = computeRetryDelayMs(attempt, failure.retryAfterMs);
+    retryState.scheduledForGenerationId = generation.id;
+
+    const reason = String(failure.label || failure.reason || 'Transient API error')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 160);
+
+    toastr.info(
+        (reason ? reason + '. ' : '') +
+        'Retrying in ' + formatRetryDelay(delayMs) +
+        ' (' + String(attempt) + '/' + String(maxRetries) + ').',
+        'Empty Response Cleaner',
+        { timeOut: Math.min(10_000, Math.max(4000, delayMs)) },
+    );
+
+    log('Scheduled API retry', {
+        generationId: generation.id,
+        type: generation.type,
+        attempt,
+        maxRetries,
+        delayMs,
+        reason,
+    });
+
+    retryState.timerId = setTimeout(async () => {
+        retryState.timerId = null;
+        retryState.scheduledForGenerationId = null;
+
+        const currentSettings = getSettings();
+        if (!currentSettings?.enabled || !currentSettings?.retryOnApiError) {
+            cancelPendingRetry(true);
+            return;
+        }
+
+        if (getCurrentChatKey() !== generation.chatKey) {
+            cancelPendingRetry(true);
+            return;
+        }
+
+        const context = SillyTavern.getContext();
+        const retryType = getRetryGenerationType(generation);
+
+        retryState.launching = true;
+        try {
+            log('Starting API retry', {
+                originalType: generation.type,
+                retryType,
+                attempt,
+            });
+
+            await context.generate(retryType, copyRetryOptions(generation.options));
+        } catch (error) {
+            // Retryable request failures are detected by the fetch wrapper and
+            // schedule the next attempt there. Avoid double-scheduling here.
+            if (!isAbortError(error)) {
+                console.warn('[' + extensionName + '] Retry generation failed', error);
+            }
+        } finally {
+            retryState.launching = false;
+        }
+    }, delayMs);
+}
+
+async function inspectGenerationResponse(response, requestInfo) {
+    let rawText = '';
+    let payload = null;
+
+    // Never consume a successful streaming response clone: doing so would wait
+    // until the entire stream finishes before SillyTavern can start reading it.
+    if (!response.ok || !requestInfo.streaming) {
+        try {
+            rawText = await response.clone().text();
+            if (rawText) {
+                try {
+                    payload = JSON.parse(rawText);
+                } catch {
+                    payload = null;
+                }
+            }
+        } catch (error) {
+            log('Could not inspect generation response body', error);
+        }
+    }
+
+    return {
+        ...classifyGenerationResponse(response, payload, rawText),
+        retryAfterMs: parseRetryAfterMs(response),
+    };
+}
+
+function installFetchInterceptor() {
+    if (globalThis[FETCH_PATCH_KEY]?.installed) {
+        return;
+    }
+
+    const originalFetch = globalThis.fetch.bind(globalThis);
+
+    const wrappedFetch = async function (input, init) {
+        const requestInfo = getGenerationRequestInfo(input, init);
+        if (!requestInfo) {
+            return originalFetch(input, init);
+        }
+
+        const generation = getActiveGeneration();
+
+        // Generation requests can also be made by quiet/background helpers.
+        // Track and consume their lifecycle, but never retry them.
+        if (!generation) {
+            return originalFetch(input, init);
+        }
+
+        try {
+            const response = await originalFetch(input, init);
+
+            if (!generation.retryable) {
+                consumeGeneration(generation.id);
+                return response;
+            }
+
+            const classification = await inspectGenerationResponse(response, requestInfo);
+
+            if (!classification.isError) {
+                markSuccessfulGenerationRequest(generation);
+            } else if (classification.retryable) {
+                consumeGeneration(generation.id);
+                scheduleGenerationRetry(generation, classification);
+            } else {
+                markNonRetryableGenerationFailure(generation);
+            }
+
+            return response;
+        } catch (error) {
+            consumeGeneration(generation.id);
+
+            if (generation.retryable && !isAbortError(error)) {
+                scheduleGenerationRetry(generation, {
+                    reason: 'Network error',
+                    label: String(error?.message || 'Network error'),
+                    retryAfterMs: null,
+                });
+            }
+
+            throw error;
+        }
+    };
+
+    globalThis.fetch = wrappedFetch;
+    globalThis[FETCH_PATCH_KEY] = {
+        installed: true,
+        originalFetch,
+    };
+
+    log('Installed generation API retry interceptor');
+}
+
+function onRetryToggle() {
+    const { extensionSettings, saveSettingsDebounced } = SillyTavern.getContext();
+    const enabled = $('#empty_response_cleaner_retry_api_errors').prop('checked');
+    extensionSettings[extensionName].retryOnApiError = enabled;
+
+    if (!enabled) {
+        cancelPendingRetry(true);
+    }
+
+    saveSettingsDebounced();
+}
+
+function onMaxRetriesChange() {
+    const { extensionSettings, saveSettingsDebounced } = SillyTavern.getContext();
+    const value = Math.round(clampNumber(
+        $('#empty_response_cleaner_max_retries').val(),
+        0,
+        10,
+        defaultSettings.maxRetries,
+    ));
+
+    extensionSettings[extensionName].maxRetries = value;
+    $('#empty_response_cleaner_max_retries').val(value);
+    saveSettingsDebounced();
+}
+
+function onRetryDelayChange() {
+    const { extensionSettings, saveSettingsDebounced } = SillyTavern.getContext();
+    const seconds = clampNumber(
+        $('#empty_response_cleaner_retry_delay').val(),
+        0.25,
+        60,
+        defaultSettings.retryDelayMs / 1000,
+    );
+
+    const milliseconds = Math.round(seconds * 1000);
+    extensionSettings[extensionName].retryDelayMs = milliseconds;
+    $('#empty_response_cleaner_retry_delay').val(milliseconds / 1000);
+    saveSettingsDebounced();
 }
 
 /**
@@ -347,6 +974,9 @@ function cleanupExtension() {
         autoCleanupTimerId = null;
     }
 
+    generationStack = [];
+    cancelPendingRetry(true);
+
     const { eventSource, event_types } = SillyTavern.getContext();
 
     if (usingCharacterMessageRenderedEvent && boundOnCharacterMessageRendered && event_types?.CHARACTER_MESSAGE_RENDERED) {
@@ -355,8 +985,24 @@ function cleanupExtension() {
         eventSource.removeListener(event_types.MESSAGE_RECEIVED, boundOnMessageReceived);
     }
 
+    if (boundOnGenerationStarted && event_types?.GENERATION_STARTED) {
+        eventSource.removeListener(event_types.GENERATION_STARTED, boundOnGenerationStarted);
+    }
+
+    if (boundOnGenerationStopped && event_types?.GENERATION_STOPPED) {
+        eventSource.removeListener(event_types.GENERATION_STOPPED, boundOnGenerationStopped);
+    }
+
+    if (boundOnChatChanged && event_types?.CHAT_CHANGED) {
+        eventSource.removeListener(event_types.CHAT_CHANGED, boundOnChatChanged);
+    }
+
     boundOnCharacterMessageRendered = null;
     boundOnMessageReceived = null;
+    boundOnGenerationStarted = null;
+    boundOnGenerationStopped = null;
+    boundOnChatChanged = null;
+    usingCharacterMessageRenderedEvent = false;
 }
 
 /**
@@ -442,6 +1088,21 @@ function registerEventListeners() {
         boundOnMessageReceived = onCharacterMessageRendered;
         usingCharacterMessageRenderedEvent = false;
         eventSource.on(event_types.MESSAGE_RECEIVED, boundOnMessageReceived);
+    }
+
+    if (event_types?.GENERATION_STARTED) {
+        boundOnGenerationStarted = onGenerationStarted;
+        eventSource.on(event_types.GENERATION_STARTED, boundOnGenerationStarted);
+    }
+
+    if (event_types?.GENERATION_STOPPED) {
+        boundOnGenerationStopped = onGenerationStopped;
+        eventSource.on(event_types.GENERATION_STOPPED, boundOnGenerationStopped);
+    }
+
+    if (event_types?.CHAT_CHANGED) {
+        boundOnChatChanged = onChatChangedForExtension;
+        eventSource.on(event_types.CHAT_CHANGED, boundOnChatChanged);
     }
 }
 
@@ -554,6 +1215,24 @@ function createSettingsUI() {
                         <span>Automatically clean empty responses (swipes + fully empty messages)</span>
                     </label>
                 </div>
+                <hr class="sysHR" />
+                <div class="empty_response_cleaner_block">
+                    <label class="checkbox_label" for="empty_response_cleaner_retry_api_errors">
+                        <input type="checkbox" id="empty_response_cleaner_retry_api_errors" />
+                        <span>Automatically retry transient API errors</span>
+                    </label>
+                    <div class="empty_response_cleaner_hint">
+                        Retries rate limits (429), 408/425, 5xx errors, timeouts, and network failures. Authentication, quota, bad-request, and moderation errors are not retried.
+                    </div>
+                </div>
+                <div class="empty_response_cleaner_block empty_response_cleaner_setting_row">
+                    <label for="empty_response_cleaner_max_retries">Max retries</label>
+                    <input class="text_pole" type="number" id="empty_response_cleaner_max_retries" min="0" max="10" step="1" />
+                </div>
+                <div class="empty_response_cleaner_block empty_response_cleaner_setting_row">
+                    <label for="empty_response_cleaner_retry_delay">Initial retry delay (seconds)</label>
+                    <input class="text_pole" type="number" id="empty_response_cleaner_retry_delay" min="0.25" max="60" step="0.25" />
+                </div>
                 <div class="empty_response_cleaner_block">
                     <div class="menu_button menu_button_icon" id="empty_response_cleaner_clean_btn">
                         <i class="fa-solid fa-broom"></i>
@@ -577,10 +1256,16 @@ function createSettingsUI() {
     // Set initial state
     $('#empty_response_cleaner_enabled').prop('checked', settings?.enabled ?? true);
     $('#empty_response_cleaner_auto_delete').prop('checked', settings?.autoDelete ?? true);
+    $('#empty_response_cleaner_retry_api_errors').prop('checked', settings?.retryOnApiError ?? true);
+    $('#empty_response_cleaner_max_retries').val(getMaxRetries());
+    $('#empty_response_cleaner_retry_delay').val(getRetryDelayMs() / 1000);
 
     // Bind event handlers
     $('#empty_response_cleaner_enabled').on('change', onEnabledToggle);
     $('#empty_response_cleaner_auto_delete').on('change', onAutoDeleteToggle);
+    $('#empty_response_cleaner_retry_api_errors').on('change', onRetryToggle);
+    $('#empty_response_cleaner_max_retries').on('change', onMaxRetriesChange);
+    $('#empty_response_cleaner_retry_delay').on('change', onRetryDelayChange);
     $('#empty_response_cleaner_clean_btn').on('click', onCleanLastMessageClick);
     $('#empty_response_cleaner_delete_btn').on('click', onDeleteLastMessageClick);
 }
@@ -589,26 +1274,16 @@ function createSettingsUI() {
  * Initialize the extension
  */
 jQuery(async () => {
-    const { eventSource, event_types } = SillyTavern.getContext();
-
     // Load settings
     loadSettings();
 
     // Create settings UI
     createSettingsUI();
 
-    // Cancel pending timers when chat changes to avoid stale cleanups firing
-    if (event_types?.CHAT_CHANGED) {
-        eventSource.on(event_types.CHAT_CHANGED, () => {
-            if (autoCleanupTimerId !== null) {
-                clearTimeout(autoCleanupTimerId);
-                autoCleanupTimerId = null;
-            }
-            lastScheduledCleanup = { messageIndex: null, at: 0 };
-        });
-    }
+    // Observe generation API requests so transient failures can be retried.
+    installFetchInterceptor();
 
-    // Prefer post-render event so cleanup happens after the visible message is built.
+    // Register message, generation, and chat lifecycle listeners.
     registerEventListeners();
 
     console.log(`[${extensionName}] Extension loaded`);
