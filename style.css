@@ -31,3 +31,31 @@
 #empty_response_cleaner_settings #empty_response_cleaner_clean_btn i {
     font-size: 1em;
 }
+
+
+#empty_response_cleaner_settings .empty_response_cleaner_setting_row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+#empty_response_cleaner_settings .empty_response_cleaner_setting_row input[type="number"] {
+    width: 96px;
+    flex: 0 0 96px;
+}
+
+#empty_response_cleaner_settings .empty_response_cleaner_hint {
+    margin-top: 6px;
+    opacity: 0.75;
+    font-size: 0.9em;
+    line-height: 1.35;
+}
+
+#empty_response_cleaner_settings #empty_response_cleaner_delete_btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    width: 100%;
+}
