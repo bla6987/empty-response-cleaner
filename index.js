@@ -345,6 +345,15 @@ function payloadContainsError(payload) {
 const NON_RETRYABLE_ERROR_PATTERN = /insufficient[_\s-]?quota|quota\s+(?:exceeded|exhausted)|billing|invalid[_\s-]?(?:api[_\s-]?)?key|authentication|unauthori[sz]ed|forbidden|permission\s+denied|invalid[_\s-]?request|bad\s+request|context\s+(?:length|window)|maximum\s+context|content\s+(?:policy|moderation)|moderation|model\s+.*not\s+found/i;
 const TRANSIENT_ERROR_PATTERN = /\b429\b|rate[\s_-]*limit|too\s+many\s+requests|temporar(?:y|ily)|overload(?:ed)?|capacity|server\s+busy|try\s+again|timeout|timed\s+out|connection\s+(?:reset|refused|closed)|econnreset|econnrefused|socket\s+hang\s+up|internal\s+server\s+error|bad\s+gateway|service\s+unavailable|gateway\s+timeout|\b5\d\d\b/i;
 
+function isUnspecifiedPayloadError(payload) {
+    const error = payload?.error ?? payload?.detail?.error;
+    const description = typeof error === 'object' && error !== null
+        ? error.message ?? error.code ?? error.type
+        : error;
+    return description === true || description == null
+        || /^(?:\s*|<none>|unknown error(?: occurred)?)$/i.test(String(description).trim());
+}
+
 function classifyGenerationResponse(response, payload, rawText) {
     const hasPayloadError = payloadContainsError(payload);
     const isError = !response.ok || hasPayloadError;
@@ -357,7 +366,10 @@ function classifyGenerationResponse(response, payload, rawText) {
     const explicitStatus = extractStatusCode(payload);
     const status = explicitStatus ?? response.status;
 
-    if (payload?.quota_error === true || NON_RETRYABLE_ERROR_PATTERN.test(errorText)) {
+    // A concrete permanent status takes precedence over vague provider wording.
+    const isPermanentStatus = (code) => code >= 400 && code < 500 && !isRetryableHttpStatus(code);
+    if (payload?.quota_error === true || NON_RETRYABLE_ERROR_PATTERN.test(errorText)
+        || isPermanentStatus(explicitStatus) || isPermanentStatus(response.status)) {
         return {
             isError: true,
             retryable: false,
@@ -366,7 +378,10 @@ function classifyGenerationResponse(response, payload, rawText) {
         };
     }
 
-    if (isRetryableHttpStatus(explicitStatus) || isRetryableHttpStatus(response.status) || TRANSIENT_ERROR_PATTERN.test(errorText)) {
+    // ST can replace an upstream failure with HTTP 200 and an error envelope,
+    // losing the original status. Retry unspecified failures within the budget.
+    if (isRetryableHttpStatus(explicitStatus) || isRetryableHttpStatus(response.status) || TRANSIENT_ERROR_PATTERN.test(errorText)
+        || (response.ok && hasPayloadError && isUnspecifiedPayloadError(payload))) {
         return {
             isError: true,
             retryable: true,
@@ -564,9 +579,11 @@ async function inspectGenerationResponse(response, requestInfo) {
     let rawText = '';
     let payload = null;
 
-    // Never consume a successful streaming response clone: doing so would wait
-    // until the entire stream finishes before SillyTavern can start reading it.
-    if (!response.ok || !requestInfo.streaming) {
+    // A streaming request may receive a finite JSON error envelope with HTTP
+    // 200. Inspect that body, but never wait for an actual SSE stream to finish.
+    const contentType = response.headers?.get?.('Content-Type') ?? '';
+    const isJsonResponse = /\bapplication\/(?:[\w.-]+\+)?json\b/i.test(contentType);
+    if (!response.ok || !requestInfo.streaming || isJsonResponse) {
         try {
             rawText = await response.clone().text();
             if (rawText) {
@@ -1222,7 +1239,7 @@ function createSettingsUI() {
                         <span>Automatically retry transient API errors</span>
                     </label>
                     <div class="empty_response_cleaner_hint">
-                        Retries rate limits (429), 408/425, 5xx errors, timeouts, and network failures. Authentication, quota, bad-request, and moderation errors are not retried.
+                        Retries rate limits (429), 408/425, 5xx errors, timeouts, network failures, and unspecified API errors. Authentication, quota, bad-request, and moderation errors are not retried.
                     </div>
                 </div>
                 <div class="empty_response_cleaner_block empty_response_cleaner_setting_row">
