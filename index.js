@@ -22,9 +22,11 @@ let autoCleanupTimerId = null;
 let boundOnCharacterMessageRendered = null;
 let boundOnMessageReceived = null;
 let boundOnGenerationStarted = null;
+let boundOnGenerateAfterData = null;
 let boundOnGenerationStopped = null;
 let boundOnChatChanged = null;
 let usingCharacterMessageRenderedEvent = false;
+let usingGenerateAfterDataEvent = false;
 
 /**
  * Get extension settings from context
@@ -84,8 +86,11 @@ const RETRYABLE_HTTP_STATUSES = new Set([408, 425, 429]);
 const FETCH_PATCH_KEY = '__empty_response_cleaner_fetch_patch__';
 const MAX_BACKOFF_MS = 30_000;
 const MAX_RETRY_AFTER_MS = 5 * 60_000;
+const RETRY_IDLE_POLL_MS = 500;
+const RETRY_IDLE_MAX_WAIT_MS = 5 * 60_000;
 
 let generationSequence = 0;
+let generationEpoch = 0;
 let generationStack = [];
 let retryState = {
     attempts: 0,
@@ -138,6 +143,10 @@ function isRetryableGenerationType(type) {
 }
 
 function cancelPendingRetry(resetAttempts = false) {
+    if (resetAttempts) {
+        // Invalidate results from requests that have already left the stack.
+        generationEpoch++;
+    }
     if (retryState.timerId !== null) {
         clearTimeout(retryState.timerId);
         retryState.timerId = null;
@@ -163,11 +172,16 @@ function onGenerationStarted(type, options = {}, dryRun = false) {
         options: copyRetryOptions(options),
         chatKey: getCurrentChatKey(),
         retryable: isRetryableGenerationType(type) && normalizedType !== 'quiet',
+        // Prompt building may run helper requests before the foreground payload
+        // exists. Later requests must also match that payload before claiming it.
+        armed: !usingGenerateAfterDataEvent,
+        requestData: null,
     };
 
     // A new foreground generation supersedes stale generation contexts.
     // If the user started it manually, it also starts a fresh retry budget.
     if (normalizedType !== 'quiet') {
+        generationEpoch++;
         if (!retryState.launching) {
             cancelPendingRetry(true);
             retryState.chatKey = generation.chatKey;
@@ -175,6 +189,7 @@ function onGenerationStarted(type, options = {}, dryRun = false) {
         generationStack = [];
     }
 
+    generation.epoch = generationEpoch;
     generationStack.push(generation);
     log('Generation started', {
         id: generation.id,
@@ -182,6 +197,20 @@ function onGenerationStarted(type, options = {}, dryRun = false) {
         retryable: generation.retryable,
         autoRetry: retryState.launching,
     });
+}
+
+function onGenerateAfterData(generateData, dryRun = false) {
+    if (dryRun) {
+        return;
+    }
+
+    const generation = getActiveGeneration();
+    if (generation) {
+        generation.armed = true;
+        // Keep the reference so later listeners' edits are included at fetch time.
+        generation.requestData = generateData;
+        log('Generation armed for API request', { id: generation.id, type: generation.type });
+    }
 }
 
 function onGenerationStopped() {
@@ -255,8 +284,35 @@ function getGenerationRequestInfo(input, init) {
     const body = parseRequestBody(init);
     return {
         path,
+        body,
         streaming: body?.stream === true || body?.streaming === true,
     };
+}
+
+function isCurrentGeneration(generation) {
+    return generation.epoch === generationEpoch && generation.chatKey === getCurrentChatKey();
+}
+
+function matchesGenerationRequest(generation, requestInfo) {
+    const body = requestInfo.body;
+    if (body?.type !== undefined && (body.type ?? 'normal') !== generation.type) {
+        return false;
+    }
+
+    const data = generation.requestData;
+    if (!data) {
+        return true; // Older ST without GENERATE_AFTER_DATA.
+    }
+
+    // generateRaw uses the same endpoints, including from hooks after arming.
+    // Match the actual prompt as well as the request type before claiming it.
+    if (requestInfo.path === '/api/backends/chat-completions/generate') {
+        if (!Array.isArray(data.prompt) || !Array.isArray(body?.messages)) return false;
+        const messages = data.prompt.filter(message => message && typeof message === 'object');
+        return JSON.stringify(messages) === JSON.stringify(body.messages);
+    }
+    const field = Object.hasOwn(data, 'input') ? 'input' : 'prompt';
+    return data[field] !== undefined && JSON.stringify(data[field]) === JSON.stringify(body?.[field]);
 }
 
 function isAbortError(error) {
@@ -457,8 +513,7 @@ function getRetryGenerationType(generation) {
 }
 
 function markSuccessfulGenerationRequest(generation) {
-    consumeGeneration(generation.id);
-
+    if (!isCurrentGeneration(generation)) return;
     if (retryState.attempts > 0 && retryState.chatKey === generation.chatKey) {
         log('API retry succeeded', { attempts: retryState.attempts });
         cancelPendingRetry(true);
@@ -466,14 +521,72 @@ function markSuccessfulGenerationRequest(generation) {
 }
 
 function markNonRetryableGenerationFailure(generation) {
-    consumeGeneration(generation.id);
-
+    if (!isCurrentGeneration(generation)) return;
     if (retryState.chatKey === generation.chatKey) {
         cancelPendingRetry(true);
     }
 }
 
+/**
+ * ST marks the body while Generate() runs and has no busy guard of its own,
+ * so starting a retry now would run a second generation over the first.
+ * @returns {boolean}
+ */
+function isGenerationInProgress() {
+    return typeof document !== 'undefined' && Boolean(document.body?.dataset?.generating);
+}
+
+/**
+ * Record the end of the chat at the moment a request failed.
+ * @returns {{chatLength: number, lastMessage: object|null, lastMes: string, swipeId: number|undefined, swipeCount: number}}
+ */
+function takeChatSnapshot() {
+    const { chat } = SillyTavern.getContext();
+    const lastMessage = chat?.[chat.length - 1] ?? null;
+
+    return {
+        chatLength: chat?.length ?? 0,
+        lastMessage,
+        lastMes: lastMessage?.mes ?? '',
+        swipeId: lastMessage?.swipe_id,
+        swipeCount: Array.isArray(lastMessage?.swipes) ? lastMessage.swipes.length : 0,
+    };
+}
+
+/**
+ * Decide whether launching the retry now could destroy or duplicate a real reply.
+ * @param {object} snapshot - Chat state from takeChatSnapshot() at failure time
+ * @param {string} retryType - Generation type the retry would use
+ * @returns {'reply-arrived'|'would-delete'|null}
+ */
+function getRetryBlocker(snapshot, retryType) {
+    const { chat } = SillyTavern.getContext();
+    const lastMessage = chat?.[chat.length - 1];
+
+    // Only a non-empty AI message at the end of the chat is at risk.
+    if (!lastMessage || lastMessage.is_user === true || isSwipeEmpty(lastMessage.mes)) {
+        return null;
+    }
+
+    const swipeCount = Array.isArray(lastMessage.swipes) ? lastMessage.swipes.length : 0;
+    if (chat.length !== snapshot.chatLength
+        || lastMessage !== snapshot.lastMessage
+        || lastMessage.mes !== snapshot.lastMes
+        || lastMessage.swipe_id !== snapshot.swipeId
+        || swipeCount !== snapshot.swipeCount) {
+        return 'reply-arrived';
+    }
+
+    // ST's regenerate deletes the last message when it isn't the user's.
+    if (retryType === 'regenerate') {
+        return 'would-delete';
+    }
+
+    return null;
+}
+
 function scheduleGenerationRetry(generation, failure) {
+    if (!isCurrentGeneration(generation)) return;
     const settings = getSettings();
 
     if (!settings?.enabled || !settings?.retryOnApiError || !generation?.retryable) {
@@ -536,9 +649,12 @@ function scheduleGenerationRetry(generation, failure) {
         reason,
     });
 
-    retryState.timerId = setTimeout(async () => {
+    const snapshot = takeChatSnapshot();
+    let idleWaitStartedAt = null;
+
+    const launchRetry = async () => {
+        if (!isCurrentGeneration(generation)) return;
         retryState.timerId = null;
-        retryState.scheduledForGenerationId = null;
 
         const currentSettings = getSettings();
         if (!currentSettings?.enabled || !currentSettings?.retryOnApiError) {
@@ -551,8 +667,36 @@ function scheduleGenerationRetry(generation, failure) {
             return;
         }
 
+        if (isGenerationInProgress()) {
+            idleWaitStartedAt ??= Date.now();
+            if (Date.now() - idleWaitStartedAt >= RETRY_IDLE_MAX_WAIT_MS) {
+                log('API retry cancelled; generation still running', { generationId: generation.id });
+                cancelPendingRetry(true);
+                return;
+            }
+
+            retryState.timerId = setTimeout(launchRetry, RETRY_IDLE_POLL_MS);
+            return;
+        }
+
+        retryState.scheduledForGenerationId = null;
+
         const context = SillyTavern.getContext();
         const retryType = getRetryGenerationType(generation);
+
+        const blocker = getRetryBlocker(snapshot, retryType);
+        if (blocker) {
+            log('API retry skipped', { generationId: generation.id, retryType, blocker });
+            cancelPendingRetry(true);
+
+            if (blocker === 'would-delete') {
+                toastr.warning(
+                    'Automatic retry skipped so an existing message is not deleted.',
+                    'Empty Response Cleaner',
+                );
+            }
+            return;
+        }
 
         retryState.launching = true;
         try {
@@ -572,7 +716,9 @@ function scheduleGenerationRetry(generation, failure) {
         } finally {
             retryState.launching = false;
         }
-    }, delayMs);
+    };
+
+    retryState.timerId = setTimeout(launchRetry, delayMs);
 }
 
 async function inspectGenerationResponse(response, requestInfo) {
@@ -619,17 +765,22 @@ function installFetchInterceptor() {
 
         const generation = getActiveGeneration();
 
-        // Generation requests can also be made by quiet/background helpers.
-        // Track and consume their lifecycle, but never retry them.
-        if (!generation) {
+        // Extensions also call these endpoints (generateRaw, connection profiles)
+        // without their own GENERATION_STARTED. Leave any request that isn't
+        // the armed generation's own alone.
+        if (!generation || !generation.armed || !isCurrentGeneration(generation)
+            || !matchesGenerationRequest(generation, requestInfo)) {
             return originalFetch(input, init);
         }
+
+        // Claim the generation before awaiting, so a concurrent helper request
+        // can't be counted as this generation's result.
+        consumeGeneration(generation.id);
 
         try {
             const response = await originalFetch(input, init);
 
             if (!generation.retryable) {
-                consumeGeneration(generation.id);
                 return response;
             }
 
@@ -638,7 +789,6 @@ function installFetchInterceptor() {
             if (!classification.isError) {
                 markSuccessfulGenerationRequest(generation);
             } else if (classification.retryable) {
-                consumeGeneration(generation.id);
                 scheduleGenerationRetry(generation, classification);
             } else {
                 markNonRetryableGenerationFailure(generation);
@@ -646,8 +796,6 @@ function installFetchInterceptor() {
 
             return response;
         } catch (error) {
-            consumeGeneration(generation.id);
-
             if (generation.retryable && !isAbortError(error)) {
                 scheduleGenerationRetry(generation, {
                     reason: 'Network error',
@@ -750,7 +898,13 @@ async function repairAndRerenderMessage(messageIndex) {
         message.swipe_id = clampedSwipeId;
 
         const activeSwipe = message.swipes[clampedSwipeId];
-        message.mes = typeof activeSwipe === 'string' ? activeSwipe : String(activeSwipe ?? '');
+        if (clampedSwipeId === currentSwipeId && isSwipeEmpty(activeSwipe) && !isSwipeEmpty(message.mes)) {
+            // ST's saveReply renders a new swipe before storing it in swipes[];
+            // keep the visible text instead of blanking it.
+            message.swipes[clampedSwipeId] = message.mes;
+        } else {
+            message.mes = typeof activeSwipe === 'string' ? activeSwipe : String(activeSwipe ?? '');
+        }
     }
 
     await waitForUiTick();
@@ -842,7 +996,16 @@ function cleanMessageSwipes(message) {
         return result;
     }
 
+    // ST's saveReply emits CHARACTER_MESSAGE_RENDERED for a new swipe before it
+    // copies mes into swipes[swipe_id]. Visible text means the swipe isn't empty.
+    const activeSwipeId = Number.isInteger(message.swipe_id) ? message.swipe_id : 0;
+    const hasVisibleText = !isSwipeEmpty(message.mes);
+
     for (let i = 0; i < message.swipes.length; i++) {
+        if (i === activeSwipeId && hasVisibleText) {
+            continue;
+        }
+
         if (isSwipeEmpty(message.swipes[i])) {
             result.emptySwipeIndexes.push(i);
         }
@@ -868,9 +1031,11 @@ function cleanMessageSwipes(message) {
 /**
  * Process the last AI message and clean empty swipes
  * @param {boolean} isManual - Whether this is a manual trigger
+ * @param {object|null} targetMessage - Message whose render triggered automatic cleanup;
+ *   when omitted, the last AI message is cleaned
  * @returns {Promise<boolean>} - True if any changes were made
  */
-async function processLastMessage(isManual = false) {
+async function processLastMessage(isManual = false, targetMessage = null) {
     const { chat } = SillyTavern.getContext();
 
     // Do nothing if chat is empty
@@ -881,17 +1046,25 @@ async function processLastMessage(isManual = false) {
         return false;
     }
 
-    // Find the last AI message
-    let lastAiMessageIndex = -1;
-    for (let i = chat.length - 1; i >= 0; i--) {
-        if (chat[i].is_user === false) {
-            lastAiMessageIndex = i;
-            break;
+    let messageIndex = -1;
+    if (targetMessage) {
+        // Clean only the message that triggered this run, wherever it is now.
+        const targetIndex = chat.indexOf(targetMessage);
+        if (targetIndex !== -1 && targetMessage.is_user === false) {
+            messageIndex = targetIndex;
+        }
+    } else {
+        // Find the last AI message
+        for (let i = chat.length - 1; i >= 0; i--) {
+            if (chat[i].is_user === false) {
+                messageIndex = i;
+                break;
+            }
         }
     }
 
     // Do nothing if no AI message found
-    if (lastAiMessageIndex === -1) {
+    if (messageIndex === -1) {
         if (isManual) {
             toastr.warning('No AI message found', 'Empty Response Cleaner');
         }
@@ -903,7 +1076,7 @@ async function processLastMessage(isManual = false) {
         return false;
     }
 
-    const message = chat[lastAiMessageIndex];
+    const message = chat[messageIndex];
     const result = cleanMessageSwipes(message);
 
     if (!result.modified) {
@@ -923,12 +1096,12 @@ async function processLastMessage(isManual = false) {
             return false;
         }
 
-        const deleted = await deleteViaApi(lastAiMessageIndex);
+        const deleted = await deleteViaApi(messageIndex);
         if (!deleted) {
             return false;
         }
 
-        log('Deleted empty AI message via deleteMessage API', { messageIndex: lastAiMessageIndex });
+        log('Deleted empty AI message via deleteMessage API', { messageIndex });
         toastr.info('Removed empty AI response', 'Empty Response Cleaner');
         return true;
     }
@@ -938,16 +1111,16 @@ async function processLastMessage(isManual = false) {
 
     // Delete each empty swipe through API so ST emits MESSAGE_SWIPE_DELETED.
     for (const swipeIndex of emptyIndexesDescending) {
-        const deleted = await deleteViaApi(lastAiMessageIndex, swipeIndex);
+        const deleted = await deleteViaApi(messageIndex, swipeIndex);
         if (deleted) {
             removedSwipes++;
             log('Deleted empty swipe via deleteMessage API', {
-                messageIndex: lastAiMessageIndex,
+                messageIndex,
                 swipeIndex,
             });
 
             // Keep UI in sync immediately after each deletion.
-            await repairAndRerenderMessage(lastAiMessageIndex);
+            await repairAndRerenderMessage(messageIndex);
         }
     }
 
@@ -966,16 +1139,17 @@ async function processLastMessage(isManual = false) {
 /**
  * Prevent overlapping cleanup runs from rapid event bursts.
  * @param {boolean} isManual
+ * @param {object|null} targetMessage
  * @returns {Promise<boolean>}
  */
-async function processLastMessageLocked(isManual = false) {
+async function processLastMessageLocked(isManual = false, targetMessage = null) {
     if (isProcessing) {
         return false;
     }
 
     isProcessing = true;
     try {
-        return await processLastMessage(isManual);
+        return await processLastMessage(isManual, targetMessage);
     } finally {
         isProcessing = false;
     }
@@ -1006,6 +1180,10 @@ function cleanupExtension() {
         eventSource.removeListener(event_types.GENERATION_STARTED, boundOnGenerationStarted);
     }
 
+    if (boundOnGenerateAfterData && event_types?.GENERATE_AFTER_DATA) {
+        eventSource.removeListener(event_types.GENERATE_AFTER_DATA, boundOnGenerateAfterData);
+    }
+
     if (boundOnGenerationStopped && event_types?.GENERATION_STOPPED) {
         eventSource.removeListener(event_types.GENERATION_STOPPED, boundOnGenerationStopped);
     }
@@ -1017,9 +1195,11 @@ function cleanupExtension() {
     boundOnCharacterMessageRendered = null;
     boundOnMessageReceived = null;
     boundOnGenerationStarted = null;
+    boundOnGenerateAfterData = null;
     boundOnGenerationStopped = null;
     boundOnChatChanged = null;
     usingCharacterMessageRenderedEvent = false;
+    usingGenerateAfterDataEvent = false;
 }
 
 /**
@@ -1042,6 +1222,10 @@ function scheduleAutoCleanup(messageIndex) {
         at: now,
     };
 
+    // Tie the run to the rendered message itself; indexes can shift before the timer fires.
+    const { chat } = SillyTavern.getContext();
+    const targetMessage = messageIndex >= 0 ? (chat?.[messageIndex] ?? null) : null;
+
     // Cancel any previously pending timer before scheduling a new one
     if (autoCleanupTimerId !== null) {
         clearTimeout(autoCleanupTimerId);
@@ -1049,7 +1233,7 @@ function scheduleAutoCleanup(messageIndex) {
 
     autoCleanupTimerId = setTimeout(() => {
         autoCleanupTimerId = null;
-        processLastMessageLocked(false).catch((error) => {
+        processLastMessageLocked(false, targetMessage).catch((error) => {
             console.warn(`[${extensionName}] Auto-clean failed`, error);
         });
     }, 50);
@@ -1110,6 +1294,13 @@ function registerEventListeners() {
     if (event_types?.GENERATION_STARTED) {
         boundOnGenerationStarted = onGenerationStarted;
         eventSource.on(event_types.GENERATION_STARTED, boundOnGenerationStarted);
+    }
+
+    // Without this event (older ST), generations are armed as soon as they start.
+    if (event_types?.GENERATE_AFTER_DATA) {
+        boundOnGenerateAfterData = onGenerateAfterData;
+        usingGenerateAfterDataEvent = true;
+        eventSource.on(event_types.GENERATE_AFTER_DATA, boundOnGenerateAfterData);
     }
 
     if (event_types?.GENERATION_STOPPED) {
