@@ -302,6 +302,145 @@ test('an unchanged failed overswipe still retries', async () => {
     assert.deepEqual(h.calls, ['swipe']);
 });
 
+for (const stream of [false, true]) {
+    test(`failed swipe retries after ST restores the previous response (stream: ${stream})`, async () => {
+        const message = {
+            is_user: false, mes: 'Second', swipes: ['First', 'Second'], swipe_id: 2,
+            swipe_info: [{ extra: { model: 'first' } }, { extra: { model: 'second' } }],
+        };
+        const document = { body: { dataset: { generating: 'true', swiping: 'true' } } };
+        const h = setup({ chat: [{ is_user: true, mes: 'Hi' }, message], document });
+        h.context.generate = async type => {
+            h.calls.push(type);
+            assert.equal(message.swipe_id, 2, 'retry appends a new swipe');
+            message.mes = 'New response';
+            message.swipes.push(message.mes);
+        };
+        h.run("onGenerationStarted('swipe')");
+        await h.request({ stream, type: 'swipe' });
+        await h.fire();
+        assert.deepEqual(h.calls, [], 'wait for the enclosing swipe to finish');
+
+        // ST's endSwipe clamps the unsaved slot and reloads the stored swipe.
+        message.swipe_id = message.swipes.length - 1;
+        message.mes = message.swipes[message.swipe_id];
+        delete document.body.dataset.generating;
+        delete document.body.dataset.swiping;
+        await h.fire();
+
+        assert.deepEqual(h.calls, ['swipe']);
+        assert.deepEqual(message.swipes, ['First', 'Second', 'New response']);
+        assert.deepEqual(message.swipe_info, [{ extra: { model: 'first' } }, { extra: { model: 'second' } }]);
+    });
+}
+
+test('a fast network failure waits for native swipe state before retrying the rollback', async () => {
+    const message = { is_user: false, mes: 'First', swipes: ['First'], swipe_id: 1 };
+    const h = setup({
+        chat: [{ is_user: true, mes: 'Hi' }, message],
+        responses: [() => { throw new TypeError('Failed to fetch'); }],
+    });
+    let state = 'swiping';
+    h.context.swipe = { state: () => state };
+    h.run("onGenerationStarted('swipe')");
+    await assert.rejects(h.request(), /Failed to fetch/);
+    // The opening animation has not yet set dataset.swiping.
+    message.swipe_id = 0;
+    await h.fire();
+    assert.deepEqual(h.calls, []);
+    state = 'none';
+    await h.fire();
+    assert.deepEqual(h.calls, ['swipe']);
+    assert.deepEqual(message.swipes, ['First']);
+});
+
+test('repeated API failures after native rollback keep the shared retry limit and saved response', async () => {
+    const message = {
+        is_user: false, mes: 'First', swipes: ['First'], swipe_id: 1,
+        swipe_info: [{ extra: { model: 'original' } }],
+    };
+    const document = { body: { dataset: { swiping: 'true' } } };
+    const h = setup({ chat: [{ is_user: true, mes: 'Hi' }, message], document });
+    h.context.generate = async type => {
+        h.calls.push(type);
+        assert.equal(message.swipe_id, 1);
+        h.run(`onGenerationStarted(${JSON.stringify(type)})`);
+        await h.request();
+    };
+    h.run("onGenerationStarted('swipe')");
+    await h.request();
+    message.swipe_id = 0;
+    delete document.body.dataset.swiping;
+    for (let i = 0; i < 3; i++) await h.fire();
+    assert.deepEqual(h.calls, ['swipe', 'swipe', 'swipe']);
+    assert.equal(h.timers.size, 0);
+    assert.equal(h.warnings.length, 1);
+    assert.match(h.warnings[0], /limit reached/);
+    assert.equal(message.swipe_id, 0);
+    assert.equal(message.mes, 'First');
+    assert.deepEqual(message.swipes, ['First']);
+    assert.deepEqual(message.swipe_info, [{ extra: { model: 'original' } }]);
+});
+
+test('browsing after an automatic swipe rollback still cancels retry', async () => {
+    const message = { is_user: false, mes: 'First', swipes: ['First'], swipe_id: 1 };
+    const document = { body: { dataset: { swiping: 'true' } } };
+    const h = setup({ chat: [{ is_user: true, mes: 'Hi' }, message], document });
+    h.run("onGenerationStarted('swipe')");
+    await h.request();
+    message.swipe_id = 0;
+    delete document.body.dataset.swiping;
+    // Unlike endSwipe's rollback, an explicit swipe emits MESSAGE_SWIPED.
+    h.run('onMessageSwiped(1)');
+    assert.equal(h.timers.size, 0);
+    assert.deepEqual(h.calls, []);
+});
+
+test('swipe navigation listener cancels retries and is removed on cleanup', async () => {
+    const message = { is_user: false, mes: 'First', swipes: ['First'], swipe_id: 1 };
+    const document = { body: { dataset: { swiping: 'true' } } };
+    const h = setup({ chat: [{ is_user: true, mes: 'Hi' }, message], document });
+    const listeners = new Map();
+    h.context.event_types = { CHARACTER_MESSAGE_RENDERED: 'rendered', MESSAGE_SWIPED: 'swiped' };
+    h.context.eventSource = {
+        on(event, callback) {
+            if (!listeners.has(event)) listeners.set(event, new Set());
+            listeners.get(event).add(callback);
+        },
+        removeListener(event, callback) { listeners.get(event)?.delete(callback); },
+    };
+    h.run('registerEventListeners(); registerEventListeners()');
+    assert.equal(listeners.get('swiped').size, 1);
+    h.run("onGenerationStarted('swipe')");
+    await h.request();
+    message.swipe_id = 0;
+    delete document.body.dataset.swiping;
+    for (const callback of listeners.get('swiped')) callback(1);
+    assert.equal(h.timers.size, 0);
+    assert.deepEqual(h.calls, []);
+    h.run('cleanupExtension()');
+    assert.equal(listeners.get('swiped').size, 0);
+    assert.equal(listeners.get('rendered').size, 0);
+});
+
+for (const change of ['text', 'swipes', 'selection', 'message']) {
+    test(`swipe rollback does not permit a changed ${change}`, async () => {
+        const message = { is_user: false, mes: 'Second', swipes: ['First', 'Second'], swipe_id: 2 };
+        const document = { body: { dataset: { swiping: 'true' } } };
+        const h = setup({ chat: [{ is_user: true, mes: 'Hi' }, message], document });
+        h.run("onGenerationStarted('swipe')");
+        await h.request();
+        message.swipe_id = 1;
+        if (change === 'text') message.mes = 'Updated reply';
+        if (change === 'swipes') message.swipes[0] = 'Edited first';
+        if (change === 'selection') Object.assign(message, { swipe_id: 0, mes: 'First' });
+        if (change === 'message') h.context.chat.push({ is_user: false, mes: 'New reply' });
+        delete document.body.dataset.swiping;
+        await h.fire();
+        assert.deepEqual(h.calls, []);
+    });
+}
+
 for (const [url, field] of [
     ['/api/backends/text-completions/generate', 'prompt'],
     ['/api/backends/kobold/generate', 'prompt'],

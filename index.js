@@ -25,6 +25,7 @@ let boundOnGenerationStarted = null;
 let boundOnGenerateAfterData = null;
 let boundOnGenerationStopped = null;
 let boundOnChatChanged = null;
+let boundOnMessageSwiped = null;
 let usingCharacterMessageRenderedEvent = false;
 let usingGenerateAfterDataEvent = false;
 
@@ -253,6 +254,15 @@ function onChatChangedForExtension() {
     lastScheduledCleanup = { messageIndex: null, at: 0 };
     generationStack = [];
     cancelPendingRetry(true);
+}
+
+function onMessageSwiped(messageIndex) {
+    const { chat } = SillyTavern.getContext();
+    if (retryState.snapshot && chat?.[messageIndex] === retryState.snapshot.lastMessage) {
+        // Explicit navigation emits MESSAGE_SWIPED; endSwipe's automatic
+        // rollback only reloads the stored swipe and does not emit this event.
+        cancelPendingRetry(true);
+    }
 }
 
 function getActiveGeneration() {
@@ -614,14 +624,21 @@ function markNonRetryableGenerationFailure(generation) {
     }
 }
 
+function isSwipeInProgress() {
+    // The native state covers the opening animation, before dataset.swiping
+    // is set while endSwipe waits for Generate().
+    return SillyTavern.getContext().swipe?.state?.() === 'swiping'
+        || (typeof document !== 'undefined' && Boolean(document.body?.dataset?.swiping));
+}
+
 /**
  * Wait for both Generate() and the enclosing swipe animation to finish.
  * ST has no generation busy guard of its own.
  * @returns {boolean}
  */
 function isGenerationInProgress() {
-    return typeof document !== 'undefined'
-        && Boolean(document.body?.dataset?.generating || document.body?.dataset?.swiping);
+    return isSwipeInProgress()
+        || (typeof document !== 'undefined' && Boolean(document.body?.dataset?.generating));
 }
 
 /**
@@ -650,6 +667,22 @@ function isChatSnapshotUnchanged(snapshot) {
         && current.swipeId === snapshot.swipeId
         && current.swipeCount === snapshot.swipeCount
         && JSON.stringify(current.swipes) === JSON.stringify(snapshot.swipes);
+}
+
+function getFailedSwipeRollbackSnapshot(generation, snapshot) {
+    if (generation.type !== 'swipe' || !isSwipeInProgress()
+        || snapshot.lastMessage !== generation.swipeMessage
+        || !snapshot.swipeCount || snapshot.swipeId !== snapshot.swipeCount) {
+        return null;
+    }
+
+    // ST's endSwipe clamps an unsaved slot back to the last stored swipe.
+    // Accept only that exact rollback, with the same message and swipe texts.
+    return {
+        ...snapshot,
+        swipeId: snapshot.swipeCount - 1,
+        lastMes: snapshot.swipes[snapshot.swipeCount - 1],
+    };
 }
 
 /**
@@ -834,6 +867,8 @@ function scheduleGenerationRetry(generation, failure) {
     });
 
     retryState.snapshot = takeChatSnapshot();
+    const rollbackSnapshot = failure.emptySwipe
+        ? null : getFailedSwipeRollbackSnapshot(generation, retryState.snapshot);
     let idleWaitStartedAt = null;
 
     const launchRetry = async () => {
@@ -868,6 +903,9 @@ function scheduleGenerationRetry(generation, failure) {
         const context = SillyTavern.getContext();
         const retryType = getRetryGenerationType(generation);
 
+        if (rollbackSnapshot && isChatSnapshotUnchanged(rollbackSnapshot)) {
+            retryState.snapshot = rollbackSnapshot;
+        }
         const snapshot = retryState.snapshot;
         const blocker = failure.emptySwipe && !isChatSnapshotUnchanged(snapshot)
             ? 'reply-arrived' : getRetryBlocker(snapshot, retryType);
@@ -1472,12 +1510,17 @@ function cleanupExtension() {
         eventSource.removeListener(event_types.CHAT_CHANGED, boundOnChatChanged);
     }
 
+    if (boundOnMessageSwiped && event_types?.MESSAGE_SWIPED) {
+        eventSource.removeListener(event_types.MESSAGE_SWIPED, boundOnMessageSwiped);
+    }
+
     boundOnCharacterMessageRendered = null;
     boundOnMessageReceived = null;
     boundOnGenerationStarted = null;
     boundOnGenerateAfterData = null;
     boundOnGenerationStopped = null;
     boundOnChatChanged = null;
+    boundOnMessageSwiped = null;
     usingCharacterMessageRenderedEvent = false;
     usingGenerateAfterDataEvent = false;
 }
@@ -1594,6 +1637,11 @@ function registerEventListeners() {
     if (event_types?.CHAT_CHANGED) {
         boundOnChatChanged = onChatChangedForExtension;
         eventSource.on(event_types.CHAT_CHANGED, boundOnChatChanged);
+    }
+
+    if (event_types?.MESSAGE_SWIPED) {
+        boundOnMessageSwiped = onMessageSwiped;
+        eventSource.on(event_types.MESSAGE_SWIPED, boundOnMessageSwiped);
     }
 }
 
