@@ -88,16 +88,24 @@ const MAX_BACKOFF_MS = 30_000;
 const MAX_RETRY_AFTER_MS = 5 * 60_000;
 const RETRY_IDLE_POLL_MS = 500;
 const RETRY_IDLE_MAX_WAIT_MS = 5 * 60_000;
+const MAX_HTML_PAGE_CHARS = 256 * 1024;
 
 let generationSequence = 0;
+let foregroundGenerationId = 0;
 let generationEpoch = 0;
 let generationStack = [];
+// Fetch success is not swipe success: wait for ST's final rendered text.
+let pendingSwipeGeneration = null;
+let swipeCompletionTimerId = null;
+let emptySwipeCompletion = null;
 let retryState = {
     attempts: 0,
     timerId: null,
     scheduledForGenerationId: null,
     chatKey: null,
     launching: false,
+    launchedGenerationId: null,
+    snapshot: null,
 };
 
 function clampNumber(value, min, max, fallback) {
@@ -146,6 +154,12 @@ function cancelPendingRetry(resetAttempts = false) {
     if (resetAttempts) {
         // Invalidate results from requests that have already left the stack.
         generationEpoch++;
+        pendingSwipeGeneration = null;
+        emptySwipeCompletion = null;
+        if (swipeCompletionTimerId !== null) {
+            clearTimeout(swipeCompletionTimerId);
+            swipeCompletionTimerId = null;
+        }
     }
     if (retryState.timerId !== null) {
         clearTimeout(retryState.timerId);
@@ -153,6 +167,7 @@ function cancelPendingRetry(resetAttempts = false) {
     }
 
     retryState.scheduledForGenerationId = null;
+    retryState.snapshot = null;
 
     if (resetAttempts) {
         retryState.attempts = 0;
@@ -176,15 +191,25 @@ function onGenerationStarted(type, options = {}, dryRun = false) {
         // exists. Later requests must also match that payload before claiming it.
         armed: !usingGenerateAfterDataEvent,
         requestData: null,
+        swipeMessage: normalizedType === 'swipe' ? SillyTavern.getContext().chat?.at(-1) : null,
     };
 
     // A new foreground generation supersedes stale generation contexts.
     // If the user started it manually, it also starts a fresh retry budget.
     if (normalizedType !== 'quiet') {
+        foregroundGenerationId = generation.id;
+        pendingSwipeGeneration = null;
+        emptySwipeCompletion = null;
+        if (swipeCompletionTimerId !== null) {
+            clearTimeout(swipeCompletionTimerId);
+            swipeCompletionTimerId = null;
+        }
         generationEpoch++;
-        if (!retryState.launching) {
+        if (!retryState.launching || retryState.launchedGenerationId !== null) {
             cancelPendingRetry(true);
             retryState.chatKey = generation.chatKey;
+        } else {
+            retryState.launchedGenerationId = generation.id;
         }
         generationStack = [];
     }
@@ -374,6 +399,66 @@ function stringifyErrorValue(value) {
     }
 }
 
+const HTML_PAGE_PATTERN = /^\s*(?:<\?xml[^>]*>\s*)?(?:<!--[\s\S]*?-->\s*)*<(?:!doctype\s+html|html|head|body|title|meta|h1|center)\b/i;
+const EMBEDDED_HTML_PATTERN = /<(?:!doctype\s+html|html|head|body|title)\b/i;
+
+function decodeHtmlEntities(text) {
+    const named = {
+        amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', hellip: '\u2026', middot: '\u00B7',
+        ndash: '\u2013', mdash: '\u2014', lsquo: '\u2018', rsquo: '\u2019', ldquo: '\u201C', rdquo: '\u201D',
+    };
+    return text.replace(/&(?:#(\d+)|#x([\da-f]+)|([a-z]+));/gi, (entity, decimal, hex, name) => {
+        if (name) {
+            return named[name.toLowerCase()] ?? entity;
+        }
+        const codePoint = decimal ? Number(decimal) : parseInt(hex, 16);
+        return codePoint > 0 && codePoint <= 0x10FFFF ? String.fromCodePoint(codePoint) : entity;
+    });
+}
+
+function getHtmlText(html) {
+    return decodeHtmlEntities(html.replace(/<[^>]*>/g, ' ')).replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Reduce an HTML error page (proxy, CDN, or gateway) to readable text.
+ * Markup, scripts, and styles would otherwise trip the error-wording patterns.
+ * @param {string} html
+ * @returns {string}
+ */
+function summarizeHtml(html) {
+    const visible = html
+        .replace(/<!--[\s\S]*?-->/g, ' ')
+        .replace(/<(script|style|noscript|template|svg)\b[\s\S]*?<\/\1\s*>/gi, ' ');
+    const headings = [
+        visible.match(/<title\b[^>]*>([\s\S]*?)<\/title\s*>/i)?.[1],
+        visible.match(/<h1\b[^>]*>([\s\S]*?)<\/h1\s*>/i)?.[1],
+    ].map(piece => getHtmlText(piece ?? '')).filter(Boolean);
+
+    const unique = headings.filter((piece, index) => !headings.slice(0, index).some(other => other.includes(piece)));
+    if (unique.length) {
+        return unique.join(' - ').slice(0, 300);
+    }
+
+    const body = visible.match(/<body\b[^>]*>([\s\S]*)/i)?.[1] ?? visible;
+    return getHtmlText(body).slice(0, 300);
+}
+
+/**
+ * Describe a response body that is an HTML page rather than an API reply.
+ * @param {string} rawText
+ * @returns {{summary: string, status: number|null}|null}
+ */
+function describeHtmlPage(rawText) {
+    if (typeof rawText !== 'string' || !HTML_PAGE_PATTERN.test(rawText.replace(/^﻿/, ''))) {
+        return null;
+    }
+
+    const summary = summarizeHtml(rawText);
+    const status = summary.match(/\b([45]\d\d)\b/);
+    return { summary, status: status ? Number(status[1]) : null };
+}
+
 function getErrorText(payload, rawText = '') {
     const pieces = [
         stringifyErrorValue(payload?.error),
@@ -381,7 +466,7 @@ function getErrorText(payload, rawText = '') {
         stringifyErrorValue(payload?.detail),
         stringifyErrorValue(payload?.message),
         stringifyErrorValue(payload?.response),
-    ].filter(Boolean);
+    ].filter(Boolean).map(piece => EMBEDDED_HTML_PATTERN.test(piece) ? summarizeHtml(piece) : piece);
 
     const combined = pieces.join(' ');
     return (combined || rawText || '').slice(0, 4000);
@@ -412,46 +497,44 @@ function isUnspecifiedPayloadError(payload) {
 
 function classifyGenerationResponse(response, payload, rawText) {
     const hasPayloadError = payloadContainsError(payload);
-    const isError = !response.ok || hasPayloadError;
+    // Proxies, CDNs, and gateways can answer with a web page, even with HTTP 200.
+    const htmlPage = payload ? null : describeHtmlPage(rawText);
+    const isError = !response.ok || hasPayloadError || htmlPage !== null;
 
     if (!isError) {
         return { isError: false, retryable: false };
     }
 
-    const errorText = getErrorText(payload, rawText);
-    const explicitStatus = extractStatusCode(payload);
+    const errorText = htmlPage
+        ? ('HTML page instead of an API response' + (htmlPage.summary ? ': ' + htmlPage.summary : ''))
+        : getErrorText(payload, rawText);
+    // A status read from the page's title only stands in for a masked HTTP 200.
+    const explicitStatus = extractStatusCode(payload) ?? (response.ok ? htmlPage?.status : null) ?? null;
     const status = explicitStatus ?? response.status;
+    const result = (retryable) => ({
+        isError: true,
+        retryable,
+        status,
+        label: errorText || ('HTTP ' + String(status)),
+        htmlPage,
+    });
 
     // A concrete permanent status takes precedence over vague provider wording.
     const isPermanentStatus = (code) => code >= 400 && code < 500 && !isRetryableHttpStatus(code);
     if (payload?.quota_error === true || NON_RETRYABLE_ERROR_PATTERN.test(errorText)
         || isPermanentStatus(explicitStatus) || isPermanentStatus(response.status)) {
-        return {
-            isError: true,
-            retryable: false,
-            status,
-            label: errorText || ('HTTP ' + String(status)),
-        };
+        return result(false);
     }
 
     // ST can replace an upstream failure with HTTP 200 and an error envelope,
     // losing the original status. Retry unspecified failures within the budget.
     if (isRetryableHttpStatus(explicitStatus) || isRetryableHttpStatus(response.status) || TRANSIENT_ERROR_PATTERN.test(errorText)
-        || (response.ok && hasPayloadError && isUnspecifiedPayloadError(payload))) {
-        return {
-            isError: true,
-            retryable: true,
-            status,
-            label: errorText || ('HTTP ' + String(status)),
-        };
+        || (response.ok && hasPayloadError && isUnspecifiedPayloadError(payload))
+        || (response.ok && htmlPage !== null)) {
+        return result(true);
     }
 
-    return {
-        isError: true,
-        retryable: false,
-        status,
-        label: errorText || ('HTTP ' + String(status)),
-    };
+    return result(false);
 }
 
 function parseRetryAfterMs(response) {
@@ -512,8 +595,12 @@ function getRetryGenerationType(generation) {
     return originalType;
 }
 
-function markSuccessfulGenerationRequest(generation) {
+function markSuccessfulGenerationRequest(generation, rendered = false) {
     if (!isCurrentGeneration(generation)) return;
+    if (generation.type === 'swipe' && !rendered) {
+        pendingSwipeGeneration = generation;
+        return;
+    }
     if (retryState.attempts > 0 && retryState.chatKey === generation.chatKey) {
         log('API retry succeeded', { attempts: retryState.attempts });
         cancelPendingRetry(true);
@@ -528,17 +615,18 @@ function markNonRetryableGenerationFailure(generation) {
 }
 
 /**
- * ST marks the body while Generate() runs and has no busy guard of its own,
- * so starting a retry now would run a second generation over the first.
+ * Wait for both Generate() and the enclosing swipe animation to finish.
+ * ST has no generation busy guard of its own.
  * @returns {boolean}
  */
 function isGenerationInProgress() {
-    return typeof document !== 'undefined' && Boolean(document.body?.dataset?.generating);
+    return typeof document !== 'undefined'
+        && Boolean(document.body?.dataset?.generating || document.body?.dataset?.swiping);
 }
 
 /**
  * Record the end of the chat at the moment a request failed.
- * @returns {{chatLength: number, lastMessage: object|null, lastMes: string, swipeId: number|undefined, swipeCount: number}}
+ * @returns {{chatLength: number, lastMessage: object|null, lastMes: string, swipeId: number|undefined, swipeCount: number, swipes: Array|null}}
  */
 function takeChatSnapshot() {
     const { chat } = SillyTavern.getContext();
@@ -550,7 +638,108 @@ function takeChatSnapshot() {
         lastMes: lastMessage?.mes ?? '',
         swipeId: lastMessage?.swipe_id,
         swipeCount: Array.isArray(lastMessage?.swipes) ? lastMessage.swipes.length : 0,
+        swipes: Array.isArray(lastMessage?.swipes) ? [...lastMessage.swipes] : null,
     };
+}
+
+function isChatSnapshotUnchanged(snapshot) {
+    const current = takeChatSnapshot();
+    return current.chatLength === snapshot.chatLength
+        && current.lastMessage === snapshot.lastMessage
+        && current.lastMes === snapshot.lastMes
+        && current.swipeId === snapshot.swipeId
+        && current.swipeCount === snapshot.swipeCount
+        && JSON.stringify(current.swipes) === JSON.stringify(snapshot.swipes);
+}
+
+/**
+ * Handle only the completed swipe associated with a successful foreground fetch.
+ * Cleanup runs after saveReply/streaming and the swipe animation have settled.
+ */
+function handleCompletedSwipe(messageIndex, type) {
+    const generation = pendingSwipeGeneration;
+    const { chat } = SillyTavern.getContext();
+    if (emptySwipeCompletion && isCurrentGeneration(emptySwipeCompletion.generation)
+        && chat?.[messageIndex] === emptySwipeCompletion.message) {
+        return true; // Duplicate render events must not run a second cleanup.
+    }
+    if (!generation || !isCurrentGeneration(generation)
+        || (type !== undefined && type !== 'swipe')
+        || chat?.[messageIndex] !== generation.swipeMessage
+        || messageIndex !== chat.length - 1) {
+        return false;
+    }
+
+    pendingSwipeGeneration = null;
+    if (!isSwipeEmpty(generation.swipeMessage.mes)) {
+        markSuccessfulGenerationRequest(generation, true);
+        return false;
+    }
+
+    if (!getSettings()?.retryOnApiError || getMaxRetries() <= 0) {
+        return false;
+    }
+
+    const snapshot = takeChatSnapshot();
+    // Non-streaming saveReply stores the active swipe after the render event.
+    if (snapshot.swipes && snapshot.swipeId < snapshot.swipeCount) {
+        snapshot.swipes[snapshot.swipeId] = snapshot.lastMes;
+    }
+    emptySwipeCompletion = { generation, message: generation.swipeMessage };
+    const startedAt = Date.now();
+    const finishEmptySwipe = async () => {
+        swipeCompletionTimerId = null;
+        if (!isCurrentGeneration(generation)) return;
+        if (!getSettings()?.enabled || !getSettings()?.retryOnApiError
+            || !isChatSnapshotUnchanged(snapshot)) {
+            cancelPendingRetry(true);
+            return;
+        }
+        if (isGenerationInProgress() || isProcessing) {
+            if (Date.now() - startedAt >= RETRY_IDLE_MAX_WAIT_MS) {
+                cancelPendingRetry(true);
+                return;
+            }
+            swipeCompletionTimerId = setTimeout(runCompletion, RETRY_IDLE_POLL_MS);
+            return;
+        }
+
+        const message = generation.swipeMessage;
+        // Predict the official deletion API's resulting selection, so a user
+        // changing swipes while asynchronous cleanup runs still cancels retry.
+        const expectedSwipes = Array.isArray(message.swipes) ? [...message.swipes] : null;
+        let expectedId = message.swipe_id;
+        let expectedMes = message.mes;
+        if (getSettings()?.autoDelete && expectedSwipes) {
+            for (let i = expectedSwipes.length - 1; i >= 0; i--) {
+                if (!isSwipeEmpty(expectedSwipes[i])) continue;
+                expectedSwipes.splice(i, 1);
+                if (i < expectedId) expectedId--;
+                else if (i === expectedId) expectedId = Math.min(i, expectedSwipes.length - 1);
+            }
+            expectedMes = expectedSwipes[expectedId];
+            await processLastMessageLocked(false, message);
+        }
+        if (!isCurrentGeneration(generation)) return;
+
+        const current = takeChatSnapshot();
+        if (current.chatLength !== snapshot.chatLength || current.lastMessage !== message
+            || !expectedSwipes?.length || current.swipeId !== expectedId
+            || current.lastMes !== expectedMes
+            || JSON.stringify(current.swipes) !== JSON.stringify(expectedSwipes)) {
+            cancelPendingRetry(true);
+            return;
+        }
+
+        emptySwipeCompletion = null;
+        scheduleGenerationRetry(generation, { label: 'Empty swipe response', emptySwipe: true });
+    };
+    const runCompletion = () => finishEmptySwipe().catch(error => {
+        if (isCurrentGeneration(generation)) cancelPendingRetry(true);
+        console.warn(`[${extensionName}] Empty swipe retry failed`, error);
+    });
+    swipeCompletionTimerId = setTimeout(runCompletion, 50);
+    return true;
 }
 
 /**
@@ -568,12 +757,7 @@ function getRetryBlocker(snapshot, retryType) {
         return null;
     }
 
-    const swipeCount = Array.isArray(lastMessage.swipes) ? lastMessage.swipes.length : 0;
-    if (chat.length !== snapshot.chatLength
-        || lastMessage !== snapshot.lastMessage
-        || lastMessage.mes !== snapshot.lastMes
-        || lastMessage.swipe_id !== snapshot.swipeId
-        || swipeCount !== snapshot.swipeCount) {
+    if (!isChatSnapshotUnchanged(snapshot)) {
         return 'reply-arrived';
     }
 
@@ -615,7 +799,7 @@ function scheduleGenerationRetry(generation, failure) {
     if (retryState.attempts >= maxRetries) {
         retryState.scheduledForGenerationId = generation.id;
         toastr.warning(
-            'Automatic API retry limit reached (' + String(maxRetries) + ').',
+            'Automatic retry limit reached (' + String(maxRetries) + ').',
             'Empty Response Cleaner',
             { timeOut: 8000 },
         );
@@ -649,7 +833,7 @@ function scheduleGenerationRetry(generation, failure) {
         reason,
     });
 
-    const snapshot = takeChatSnapshot();
+    retryState.snapshot = takeChatSnapshot();
     let idleWaitStartedAt = null;
 
     const launchRetry = async () => {
@@ -684,7 +868,9 @@ function scheduleGenerationRetry(generation, failure) {
         const context = SillyTavern.getContext();
         const retryType = getRetryGenerationType(generation);
 
-        const blocker = getRetryBlocker(snapshot, retryType);
+        const snapshot = retryState.snapshot;
+        const blocker = failure.emptySwipe && !isChatSnapshotUnchanged(snapshot)
+            ? 'reply-arrived' : getRetryBlocker(snapshot, retryType);
         if (blocker) {
             log('API retry skipped', { generationId: generation.id, retryType, blocker });
             cancelPendingRetry(true);
@@ -699,6 +885,8 @@ function scheduleGenerationRetry(generation, failure) {
         }
 
         retryState.launching = true;
+        retryState.launchedGenerationId = null;
+        let swipeBeforeRetry = null;
         try {
             log('Starting API retry', {
                 originalType: generation.type,
@@ -706,6 +894,15 @@ function scheduleGenerationRetry(generation, failure) {
                 attempt,
             });
 
+            if (retryType === 'swipe') {
+                const message = context.chat?.at(-1);
+                if (message && Array.isArray(message.swipes) && message.swipes.length) {
+                    swipeBeforeRetry = takeChatSnapshot();
+                    // saveReply writes at swipe_id. Always append, even after
+                    // cleanup restored the visible selection to a valid reply.
+                    message.swipe_id = message.swipes.length;
+                }
+            }
             await context.generate(retryType, copyRetryOptions(generation.options));
         } catch (error) {
             // Retryable request failures are detected by the fetch wrapper and
@@ -715,21 +912,78 @@ function scheduleGenerationRetry(generation, failure) {
             }
         } finally {
             retryState.launching = false;
+            const message = context.chat?.at(-1);
+            if (foregroundGenerationId === (retryState.launchedGenerationId ?? generation.id)
+                && getCurrentChatKey() === generation.chatKey && swipeBeforeRetry
+                && message === swipeBeforeRetry.lastMessage
+                && message.swipe_id === swipeBeforeRetry.swipeCount
+                && Array.isArray(message.swipes)
+                && message.swipes.length === swipeBeforeRetry.swipeCount) {
+                // A failed request never saved the new slot. Restore the prior
+                // selection, keeping any scheduled API retry's snapshot in sync
+                // with this deliberate rollback only.
+                const canRefreshSnapshot = retryState.snapshot
+                    && isChatSnapshotUnchanged(retryState.snapshot);
+                message.swipe_id = Math.min(swipeBeforeRetry.swipeId ?? 0, message.swipes.length - 1);
+                message.mes = message.swipes[message.swipe_id];
+                if (canRefreshSnapshot) retryState.snapshot = takeChatSnapshot();
+                await repairAndRerenderMessage(context.chat.length - 1);
+            }
         }
     };
 
     retryState.timerId = setTimeout(launchRetry, delayMs);
 }
 
+/**
+ * Read a streaming body only if it turns out to be an HTML page.
+ * ST forwards streams without a Content-Type, so check the first bytes:
+ * SSE and JSON never start with '<'. A real stream is left alone after that.
+ * @param {Response} response
+ * @returns {Promise<string>} The page, or '' for anything else
+ */
+async function readStreamingHtmlPage(response) {
+    const reader = response.clone().body?.getReader?.();
+    if (!reader) {
+        return '';
+    }
+
+    const decoder = new TextDecoder();
+    let text = '';
+    try {
+        while (text.length < MAX_HTML_PAGE_CHARS) {
+            const { done, value } = await reader.read();
+            if (done) {
+                text += decoder.decode();
+                break;
+            }
+            text += decoder.decode(value, { stream: true });
+            const start = text.replace(/^﻿/, '').trimStart();
+            if (start && !start.startsWith('<')) {
+                return '';
+            }
+        }
+        return text;
+    } catch (error) {
+        log('Could not inspect streaming response body', error);
+        return '';
+    } finally {
+        // Cancelling the clone leaves the original body intact for ST.
+        reader.cancel().catch(() => {});
+    }
+}
+
 async function inspectGenerationResponse(response, requestInfo) {
     let rawText = '';
     let payload = null;
 
-    // A streaming request may receive a finite JSON error envelope with HTTP
-    // 200. Inspect that body, but never wait for an actual SSE stream to finish.
+    // A streaming request may receive a finite JSON error envelope or HTML page
+    // with HTTP 200. Inspect those bodies, but never wait for a real SSE stream.
     const contentType = response.headers?.get?.('Content-Type') ?? '';
     const isJsonResponse = /\bapplication\/(?:[\w.-]+\+)?json\b/i.test(contentType);
-    if (!response.ok || !requestInfo.streaming || isJsonResponse) {
+    const isHtmlResponse = /\b(?:text\/html|application\/xhtml\+xml)\b/i.test(contentType);
+    const isStreamResponse = /\b(?:text\/event-stream|application\/(?:x-)?ndjson)\b/i.test(contentType);
+    if (!response.ok || !requestInfo.streaming || isJsonResponse || isHtmlResponse) {
         try {
             rawText = await response.clone().text();
             if (rawText) {
@@ -742,12 +996,32 @@ async function inspectGenerationResponse(response, requestInfo) {
         } catch (error) {
             log('Could not inspect generation response body', error);
         }
+    } else if (!isStreamResponse) {
+        rawText = await readStreamingHtmlPage(response);
     }
 
     return {
         ...classifyGenerationResponse(response, payload, rawText),
         retryAfterMs: parseRetryAfterMs(response),
     };
+}
+
+/**
+ * Build the JSON error ST's API clients already display for failed requests.
+ * @param {Response} original - The HTTP 200 HTML response being replaced
+ * @param {{status: number, htmlPage: {summary: string}}} classification
+ * @returns {Response}
+ */
+function createHtmlErrorResponse(original, classification) {
+    original.body?.cancel?.().catch(() => {});
+
+    const status = classification.status >= 400 && classification.status <= 599 ? classification.status : 502;
+    const summary = classification.htmlPage?.summary;
+    const message = 'The API returned an HTML page instead of a response.' + (summary ? ' ' + summary : '');
+    return new Response(JSON.stringify({ error: { message } }), {
+        status,
+        headers: { 'Content-Type': 'application/json' },
+    });
 }
 
 function installFetchInterceptor() {
@@ -792,6 +1066,12 @@ function installFetchInterceptor() {
                 scheduleGenerationRetry(generation, classification);
             } else {
                 markNonRetryableGenerationFailure(generation);
+            }
+
+            // ST would treat an HTTP 200 page as a reply: an empty or garbled
+            // message. Hand it a standard API error so it reports the failure.
+            if (classification.htmlPage && response.ok && getSettings()?.enabled) {
+                return createHtmlErrorResponse(response, classification);
             }
 
             return response;
@@ -1243,8 +1523,9 @@ function scheduleAutoCleanup(messageIndex) {
  * Handler for message-rendered lifecycle event.
  * This runs after the UI has rendered, preventing stale/blank message text.
  * @param {number} messageIndex - Index of the received message
+ * @param {string|undefined} type - ST generation type, when supplied by the event
  */
-function onCharacterMessageRendered(messageIndex) {
+function onCharacterMessageRendered(messageIndex, type) {
     const settings = getSettings();
 
     // Check if auto-clean is enabled
@@ -1268,7 +1549,9 @@ function onCharacterMessageRendered(messageIndex) {
         return;
     }
 
-    scheduleAutoCleanup(messageIndex);
+    if (!handleCompletedSwipe(messageIndex, type)) {
+        scheduleAutoCleanup(messageIndex);
+    }
 }
 
 /**
@@ -1427,10 +1710,10 @@ function createSettingsUI() {
                 <div class="empty_response_cleaner_block">
                     <label class="checkbox_label" for="empty_response_cleaner_retry_api_errors">
                         <input type="checkbox" id="empty_response_cleaner_retry_api_errors" />
-                        <span>Automatically retry transient API errors</span>
+                        <span>Automatically retry API errors and empty swipes</span>
                     </label>
                     <div class="empty_response_cleaner_hint">
-                        Retries rate limits (429), 408/425, 5xx errors, timeouts, network failures, and unspecified API errors. Authentication, quota, bad-request, and moderation errors are not retried.
+                        Retries empty or whitespace-only generated swipes, rate limits (429), 408/425, 5xx errors, timeouts, network failures, HTML error pages from proxies or gateways, and unspecified API errors using the same limit and delay. Existing responses are kept. Authentication, quota, bad-request, and moderation errors are not retried.
                     </div>
                 </div>
                 <div class="empty_response_cleaner_block empty_response_cleaner_setting_row">
