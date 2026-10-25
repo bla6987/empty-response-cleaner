@@ -47,7 +47,7 @@ function setup({ chat, responses = [], document } = {}) {
     }
     const sandbox = vm.createContext({
         SillyTavern: { getContext: () => context },
-        jQuery: () => {}, console, URL, Response, Headers, Date: FakeDate,
+        jQuery: () => {}, console, URL, Response, TextDecoder, Headers, Date: FakeDate,
         window: { location: { href: 'http://localhost:8000/' } },
         document,
         requestAnimationFrame: (callback) => callback(),

@@ -40,7 +40,7 @@ function setup({ autoDelete = true, maxRetries = 3, streaming = false } = {}) {
     const document = { body: { dataset: {} } };
     class FakeDate extends Date { static now() { return clock.now; } }
     const sandbox = vm.createContext({
-        SillyTavern: { getContext: () => context }, jQuery: () => {}, console, URL, Response,
+        SillyTavern: { getContext: () => context }, jQuery: () => {}, console, URL, Response, TextDecoder,
         window: { location: { href: 'http://localhost:8000/' } }, document, Date: FakeDate,
         requestAnimationFrame: callback => callback(),
         fetch: async () => nextResponse === 'error'

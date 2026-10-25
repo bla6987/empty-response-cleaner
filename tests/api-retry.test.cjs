@@ -19,7 +19,7 @@ function setup(responseFactory) {
     };
     const sandbox = vm.createContext({
         SillyTavern: { getContext: () => context },
-        jQuery: () => {}, console, URL, Response,
+        jQuery: () => {}, console, URL, Response, TextDecoder,
         window: { location: { href: 'http://localhost:8000/' } },
         fetch: async () => responseFactory(),
         toastr: { info() {}, warning() {} },

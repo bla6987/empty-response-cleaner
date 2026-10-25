@@ -89,7 +89,7 @@ const MAX_BACKOFF_MS = 30_000;
 const MAX_RETRY_AFTER_MS = 5 * 60_000;
 const RETRY_IDLE_POLL_MS = 500;
 const RETRY_IDLE_MAX_WAIT_MS = 5 * 60_000;
-const MAX_HTML_PAGE_CHARS = 256 * 1024;
+const MAX_INSPECTION_BYTES = 256 * 1024;
 
 let generationSequence = 0;
 let foregroundGenerationId = 0;
@@ -231,7 +231,7 @@ function onGenerateAfterData(generateData, dryRun = false) {
     }
 
     const generation = getActiveGeneration();
-    if (generation) {
+    if (generation && getSettings()?.enabled && getSettings()?.retryOnApiError) {
         generation.armed = true;
         // Keep the reference so later listeners' edits are included at fetch time.
         generation.requestData = generateData;
@@ -310,13 +310,14 @@ function parseRequestBody(init) {
     }
 }
 
-function getGenerationRequestInfo(input, init) {
+function getGenerationRequestInfo(input, init, requestContext = null) {
     const path = getRequestPath(input);
     if (!GENERATION_ENDPOINTS.has(path)) {
         return null;
     }
 
-    const body = parseRequestBody(init);
+    const body = typeof requestContext?.getRequestJson === 'function'
+        ? requestContext.getRequestJson() : parseRequestBody(init);
     return {
         path,
         body,
@@ -343,8 +344,14 @@ function matchesGenerationRequest(generation, requestInfo) {
     // Match the actual prompt as well as the request type before claiming it.
     if (requestInfo.path === '/api/backends/chat-completions/generate') {
         if (!Array.isArray(data.prompt) || !Array.isArray(body?.messages)) return false;
-        const messages = data.prompt.filter(message => message && typeof message === 'object');
-        return JSON.stringify(messages) === JSON.stringify(body.messages);
+        // Compare one message at a time, keeping the exact JSON comparison while
+        // avoiding two serialized copies of the entire conversation.
+        let index = 0;
+        for (const message of data.prompt) {
+            if (!message || typeof message !== 'object') continue;
+            if (index >= body.messages.length || JSON.stringify(message) !== JSON.stringify(body.messages[index++])) return false;
+        }
+        return index === body.messages.length;
     }
     const field = Object.hasOwn(data, 'input') ? 'input' : 'prompt';
     return data[field] !== undefined && JSON.stringify(data[field]) === JSON.stringify(body?.[field]);
@@ -974,41 +981,45 @@ function scheduleGenerationRetry(generation, failure) {
 }
 
 /**
- * Read a streaming body only if it turns out to be an HTML page.
- * ST forwards streams without a Content-Type, so check the first bytes:
- * SSE and JSON never start with '<'. A real stream is left alone after that.
+ * Read a bounded diagnostic prefix from a clone. With htmlOnly, stop as soon
+ * as the first non-whitespace character identifies a real SSE/JSON stream.
  * @param {Response} response
- * @returns {Promise<string>} The page, or '' for anything else
+ * @param {boolean} htmlOnly
+ * @returns {Promise<{text: string, truncated: boolean}>}
  */
-async function readStreamingHtmlPage(response) {
+async function readInspectionPrefix(response, htmlOnly = false) {
     const reader = response.clone().body?.getReader?.();
-    if (!reader) {
-        return '';
-    }
-
+    if (!reader) return { text: '', truncated: false };
     const decoder = new TextDecoder();
     let text = '';
+    let bytes = 0;
+    let complete = false;
     try {
-        while (text.length < MAX_HTML_PAGE_CHARS) {
+        while (bytes < MAX_INSPECTION_BYTES) {
             const { done, value } = await reader.read();
-            if (done) {
-                text += decoder.decode();
-                break;
-            }
-            text += decoder.decode(value, { stream: true });
-            const start = text.replace(/^﻿/, '').trimStart();
-            if (start && !start.startsWith('<')) {
-                return '';
+            if (done) { complete = true; break; }
+            const part = value.subarray(0, MAX_INSPECTION_BYTES - bytes);
+            bytes += part.byteLength;
+            text += decoder.decode(part, { stream: true });
+            if (htmlOnly) {
+                const start = text.replace(/^\uFEFF/, '').trimStart();
+                if (start && !start.startsWith('<')) return { text: '', truncated: false };
             }
         }
-        return text;
+        text += decoder.decode();
+        return { text, truncated: !complete };
     } catch (error) {
-        log('Could not inspect streaming response body', error);
-        return '';
+        log('Could not inspect response prefix', error);
+        return { text: '', truncated: true };
     } finally {
-        // Cancelling the clone leaves the original body intact for ST.
-        reader.cancel().catch(() => {});
+        // Never await a tee cancellation: the caller owns the original body.
+        if (!complete) reader.cancel().catch(() => {});
+        reader.releaseLock?.();
     }
+}
+
+async function readStreamingHtmlPage(response) {
+    return (await readInspectionPrefix(response, true)).text;
 }
 
 async function inspectGenerationResponse(response, requestInfo) {
@@ -1023,8 +1034,9 @@ async function inspectGenerationResponse(response, requestInfo) {
     const isStreamResponse = /\b(?:text\/event-stream|application\/(?:x-)?ndjson)\b/i.test(contentType);
     if (!response.ok || !requestInfo.streaming || isJsonResponse || isHtmlResponse) {
         try {
-            rawText = await response.clone().text();
-            if (rawText) {
+            const prefix = await readInspectionPrefix(response);
+            rawText = prefix.text;
+            if (rawText && !prefix.truncated) {
                 try {
                     payload = JSON.parse(rawText);
                 } catch {
@@ -1062,76 +1074,91 @@ function createHtmlErrorResponse(original, classification) {
     });
 }
 
+function claimGenerationRequest(input, init, requestContext = null) {
+    const settings = getSettings();
+    const generation = getActiveGeneration();
+    // Most helper/disabled requests need no parsing at all.
+    if (!settings?.enabled || !settings.retryOnApiError || !generation || !generation.armed
+        || !isCurrentGeneration(generation)) return null;
+    const requestInfo = getGenerationRequestInfo(input, init, requestContext);
+    if (!requestInfo || !matchesGenerationRequest(generation, requestInfo)) return null;
+    consumeGeneration(generation.id);
+    // Exact matching is finished. Retry timers and pending swipes only need the
+    // lifecycle fields, not the full generated prompt or parsed request body.
+    generation.requestData = null;
+    return { generation, requestInfo: { path: requestInfo.path, streaming: requestInfo.streaming } };
+}
+
+async function handleGenerationFetchResponse(claim, response) {
+    const { generation, requestInfo } = claim;
+    if (!generation.retryable || !isCurrentGeneration(generation)
+        || !getSettings()?.enabled || !getSettings()?.retryOnApiError) return response;
+    const classification = await inspectGenerationResponse(response, requestInfo);
+    if (!classification.isError) markSuccessfulGenerationRequest(generation);
+    else if (classification.retryable) scheduleGenerationRetry(generation, classification);
+    else markNonRetryableGenerationFailure(generation);
+    if (classification.htmlPage && response.ok && getSettings()?.enabled) {
+        return createHtmlErrorResponse(response, classification);
+    }
+    return response;
+}
+
+function handleGenerationFetchError(claim, error) {
+    if (claim.generation.retryable && !isAbortError(error)) {
+        scheduleGenerationRetry(claim.generation, {
+            reason: 'Network error', label: String(error?.message || 'Network error'), retryAfterMs: null,
+        });
+    }
+}
+
 function installFetchInterceptor() {
-    if (globalThis[FETCH_PATCH_KEY]?.installed) {
-        return;
+    if (globalThis[FETCH_PATCH_KEY]?.installed) return;
+    const runtimeBus = window.STRuntimeBus;
+    // Bus 1.0 re-wraps an existing outer wrapper unsafely. Preserve standalone
+    // behavior in that case; v1.1 explicitly supports this registration order.
+    const olderBusUnderWrapper = !runtimeBus?.fetch?.preservesOuterWrappers
+        && runtimeBus?.fetch?.getChainInfo?.().installed
+        && window.fetch?.__fetchInterceptorName !== 'runtime_signal_bus';
+    if (!olderBusUnderWrapper && typeof runtimeBus?.fetch?.registerInterceptor === 'function') {
+        try {
+            const unregister = runtimeBus.fetch.registerInterceptor({
+                id: extensionName,
+                priority: 60,
+                requestObserve(reqCtx) {
+                    const claim = claimGenerationRequest(reqCtx.target, reqCtx.options, reqCtx);
+                    if (claim) reqCtx.meta.emptyResponseCleaner = claim;
+                },
+                async responseTransform(resCtx) {
+                    const claim = resCtx.request.meta.emptyResponseCleaner;
+                    if (!claim) return resCtx.response;
+                    delete resCtx.request.meta.emptyResponseCleaner;
+                    return handleGenerationFetchResponse(claim, resCtx.response);
+                },
+                errorObserve(errCtx) {
+                    const claim = errCtx.request.meta.emptyResponseCleaner;
+                    delete errCtx.request.meta.emptyResponseCleaner;
+                    if (claim) handleGenerationFetchError(claim, errCtx.error);
+                },
+            });
+            globalThis[FETCH_PATCH_KEY] = { installed: true, unregister };
+            return;
+        } catch (error) {
+            log('Runtime bus unavailable; installing standalone interceptor', error);
+        }
     }
 
     const originalFetch = globalThis.fetch.bind(globalThis);
-
-    const wrappedFetch = async function (input, init) {
-        const requestInfo = getGenerationRequestInfo(input, init);
-        if (!requestInfo) {
-            return originalFetch(input, init);
-        }
-
-        const generation = getActiveGeneration();
-
-        // Extensions also call these endpoints (generateRaw, connection profiles)
-        // without their own GENERATION_STARTED. Leave any request that isn't
-        // the armed generation's own alone.
-        if (!generation || !generation.armed || !isCurrentGeneration(generation)
-            || !matchesGenerationRequest(generation, requestInfo)) {
-            return originalFetch(input, init);
-        }
-
-        // Claim the generation before awaiting, so a concurrent helper request
-        // can't be counted as this generation's result.
-        consumeGeneration(generation.id);
-
+    globalThis.fetch = async function (input, init) {
+        const claim = claimGenerationRequest(input, init);
+        if (!claim) return originalFetch(input, init);
         try {
-            const response = await originalFetch(input, init);
-
-            if (!generation.retryable) {
-                return response;
-            }
-
-            const classification = await inspectGenerationResponse(response, requestInfo);
-
-            if (!classification.isError) {
-                markSuccessfulGenerationRequest(generation);
-            } else if (classification.retryable) {
-                scheduleGenerationRetry(generation, classification);
-            } else {
-                markNonRetryableGenerationFailure(generation);
-            }
-
-            // ST would treat an HTTP 200 page as a reply: an empty or garbled
-            // message. Hand it a standard API error so it reports the failure.
-            if (classification.htmlPage && response.ok && getSettings()?.enabled) {
-                return createHtmlErrorResponse(response, classification);
-            }
-
-            return response;
+            return await handleGenerationFetchResponse(claim, await originalFetch(input, init));
         } catch (error) {
-            if (generation.retryable && !isAbortError(error)) {
-                scheduleGenerationRetry(generation, {
-                    reason: 'Network error',
-                    label: String(error?.message || 'Network error'),
-                    retryAfterMs: null,
-                });
-            }
-
+            handleGenerationFetchError(claim, error);
             throw error;
         }
     };
-
-    globalThis.fetch = wrappedFetch;
-    globalThis[FETCH_PATCH_KEY] = {
-        installed: true,
-        originalFetch,
-    };
-
+    globalThis[FETCH_PATCH_KEY] = { installed: true, originalFetch };
     log('Installed generation API retry interceptor');
 }
 
@@ -1141,6 +1168,7 @@ function onRetryToggle() {
     extensionSettings[extensionName].retryOnApiError = enabled;
 
     if (!enabled) {
+        generationStack = [];
         cancelPendingRetry(true);
     }
 
