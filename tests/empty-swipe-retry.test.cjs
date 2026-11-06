@@ -63,13 +63,14 @@ function setup({ autoDelete = true, maxRetries = 3, streaming = false } = {}) {
     };
     // Reproduce ST's render-before-swipes[]-write ordering, and overwrite at
     // swipe_id just like saveReply. A retry at an old ID would corrupt the reply.
-    const render = (text = '', { type = 'swipe', duplicate = false } = {}) => {
+    const render = (text = '', { type = 'swipe', duplicate = false, extra = { model: 'retry' } } = {}) => {
         message.swipes.length++;
         message.mes = text;
+        message.extra = structuredClone(extra);
         run(`onCharacterMessageRendered(1, ${JSON.stringify(type)})`);
         if (duplicate) run(`onCharacterMessageRendered(1, ${JSON.stringify(type)})`);
         message.swipes[message.swipe_id] = message.mes;
-        message.swipe_info[message.swipe_id] = { extra: { model: 'retry' } };
+        message.swipe_info[message.swipe_id] = { extra: structuredClone(message.extra) };
     };
     context.generate = async (type, options) => {
         calls.push({ type, options, swipeId: message.swipe_id });
@@ -404,3 +405,78 @@ test('an older failed retry cannot roll back a newer foreground generation', asy
     assert.equal(h.message.swipes[0], 'Original answer');
     assert.equal(h.timers.size, 0);
 });
+
+for (const extra of [
+    { media: [{ type: 'image', url: '/answer.png' }] },
+    { files: [{ url: '/answer.txt' }] },
+    { reasoning: 'Saved reasoning without visible text' },
+    { tool_invocations: [{ name: 'lookup', result: 'Saved result' }] },
+]) {
+    for (const autoDelete of [true, false]) {
+        test(`a generated content-only swipe is retained and never retried (${Object.keys(extra)[0]}, autoDelete: ${autoDelete})`, async () => {
+            const h = setup({ autoDelete });
+            await h.start();
+            h.render('', { extra });
+            const before = structuredClone(h.message);
+            await h.drain();
+            assert.deepEqual(h.calls, []);
+            assert.deepEqual(h.deletions, []);
+            assert.deepEqual(h.message, before);
+        });
+    }
+}
+
+for (const phase of ['before cleanup', 'during retry delay']) {
+    test(`media attached ${phase} cancels an empty-swipe retry`, async () => {
+        const h = setup();
+        await h.start();
+        h.render('');
+        if (phase === 'during retry delay') await h.fire();
+        h.message.extra = { media: [{ type: 'image', url: '/late-image.png' }] };
+        const before = structuredClone(h.message);
+        await h.drain();
+        assert.deepEqual(h.calls, []);
+        assert.deepEqual(h.message, before);
+    });
+}
+
+test('empty-swipe cleanup retains a historical image-only variant and still retries the empty new slot', async () => {
+    const h = setup({ maxRetries: 1 });
+    h.message.swipes.push('');
+    const imageInfo = { extra: { media: [{ type: 'image', url: '/saved.png' }] } };
+    h.message.swipe_info.push(imageInfo);
+    h.message.swipe_id = 2;
+    await h.start();
+    h.render('');
+    await h.fire();
+    assert.deepEqual(h.message.swipes, ['Original answer', '']);
+    assert.equal(h.message.swipe_info[1], imageInfo);
+    await h.drain();
+    assert.equal(h.calls.length, 1);
+    assert.equal(h.message.swipe_info[1], imageInfo);
+    assert.deepEqual(h.message.swipes, ['Original answer', '']);
+});
+
+for (const change of ['visible text', 'role', 'media']) {
+    test(`failed automatic swipe rollback preserves concurrent ${change}`, async () => {
+        const h = setup();
+        h.context.generate = async type => {
+            h.calls.push(type);
+            h.run(`onGenerationStarted(${JSON.stringify(type)})`);
+            if (change === 'visible text') h.message.mes = 'A valid response arriving late';
+            if (change === 'role') { h.message.is_user = true; h.message.mes = 'My edited user message'; }
+            if (change === 'media') h.message.extra = { media: [{ type: 'image', url: '/late.png' }] };
+        };
+        await h.start('error');
+        const originalText = h.message.mes;
+        await h.fire();
+        assert.equal(h.calls.length, 1);
+        if (change === 'visible text') assert.equal(h.message.mes, 'A valid response arriving late');
+        if (change === 'role') assert.equal(h.message.mes, 'My edited user message');
+        if (change === 'media') {
+            assert.equal(h.message.mes, originalText);
+            assert.equal(h.message.extra.media[0].url, '/late.png');
+        }
+        assert.deepEqual(h.message.swipes, ['Original answer']);
+    });
+}

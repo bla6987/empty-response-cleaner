@@ -10,7 +10,7 @@ const flush = async () => {
     for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
 };
 
-function setup({ chat, responses = [], document } = {}) {
+function setup({ chat, responses = [], document, animationFrames } = {}) {
     const timers = new Map();
     const calls = [];
     const deletions = [];
@@ -34,6 +34,7 @@ function setup({ chat, responses = [], document } = {}) {
             const message = context.chat[id];
             const current = message.swipe_id;
             message.swipes.splice(swipeIndex, 1);
+            message.swipe_info?.splice(swipeIndex, 1);
             if (swipeIndex < current) {
                 message.swipe_id = current - 1;
             } else if (swipeIndex === current) {
@@ -50,7 +51,7 @@ function setup({ chat, responses = [], document } = {}) {
         jQuery: () => {}, console, URL, Response, TextDecoder, Headers, Date: FakeDate,
         window: { location: { href: 'http://localhost:8000/' } },
         document,
-        requestAnimationFrame: (callback) => callback(),
+        requestAnimationFrame: (callback) => animationFrames ? animationFrames.push(callback) : callback(),
         fetch: async () => {
             const next = responses.shift();
             return typeof next === 'function' ? next() : Response.json(next ?? errorPayload);
@@ -263,7 +264,8 @@ for (const action of ['onGenerationStopped()', "onGenerationStarted('swipe')", '
 
 test('an old success cannot cancel the newer generation retry', async () => {
     let resolveOld;
-    const h = setup({ responses: [() => new Promise(resolve => { resolveOld = resolve; }), errorPayload] });
+    const h = setup({ chat: [{ is_user: false, mes: 'Existing answer' }],
+        responses: [() => new Promise(resolve => { resolveOld = resolve; }), errorPayload] });
     h.run("onGenerationStarted('swipe')");
     const pending = h.request();
     h.run("onGenerationStarted('swipe')");
@@ -277,7 +279,8 @@ test('an old success cannot cancel the newer generation retry', async () => {
 
 for (const helperResult of [errorPayload, { choices: [{ message: { content: 'helper' } }] }]) {
     test(`helpers after arming leave the foreground request available (${Boolean(helperResult.error) ? 'error' : 'success'})`, async () => {
-        const h = setup({ responses: [helperResult, helperResult, errorPayload] });
+        const h = setup({ chat: [{ is_user: false, mes: 'Existing answer' }],
+            responses: [helperResult, helperResult, errorPayload] });
         h.run('usingGenerateAfterDataEvent = true');
         h.run("onGenerationStarted('swipe')");
         h.run("onGenerateAfterData({ prompt: [{ role: 'user', content: 'Main prompt' }] })");
@@ -447,7 +450,7 @@ for (const [url, field] of [
     ['/api/novelai/generate', 'input'],
 ]) {
     test(`post-hook helpers cannot claim the main ${field} request: ${url}`, async () => {
-        const h = setup();
+        const h = setup({ chat: [{ is_user: false, mes: 'Existing answer' }] });
         h.run('usingGenerateAfterDataEvent = true');
         h.run("onGenerationStarted('swipe')");
         h.run(`onGenerateAfterData({ ${field}: 'Main prompt' })`);
@@ -460,7 +463,7 @@ for (const [url, field] of [
 }
 
 test('later listeners and provider role edits remain associated with the main request', async () => {
-    const h = setup();
+    const h = setup({ chat: [{ is_user: false, mes: 'Existing answer' }] });
     h.run('usingGenerateAfterDataEvent = true');
     h.run("onGenerationStarted('swipe')");
     h.run(`
@@ -472,4 +475,256 @@ test('later listeners and provider role edits remain associated with the main re
     await h.request({ type: 'swipe', messages: [{ role: 'user', content: 'Edited' }] });
     await h.fire();
     assert.deepEqual(h.calls, ['swipe']);
+});
+
+const contentExamples = {
+    image: { media: [{ type: 'image', url: '/answer.png' }] },
+    audio: { media: [{ type: 'audio', url: '/answer.mp3' }] },
+    video: { media: [{ type: 'video', url: '/answer.mp4' }] },
+    file: { files: [{ url: '/answer.txt', name: 'answer.txt' }] },
+    legacyImage: { image: '/answer.png' },
+    legacyFile: { file: { url: '/answer.txt' } },
+    reasoning: { reasoning: 'Useful saved reasoning' },
+    toolCall: { tool_invocations: [{ name: 'lookup', result: 'Saved result' }] },
+};
+
+function swipeMessage(swipes = ['Keep', '', '']) {
+    return {
+        is_user: false, mes: swipes[0], swipe_id: 0, swipes: [...swipes],
+        swipe_info: swipes.map(() => ({ extra: {} })),
+    };
+}
+
+async function finishCleanup(pending, frames) {
+    let settled = false;
+    pending.then(() => { settled = true; }, () => { settled = true; });
+    for (let i = 0; !settled && i < 8; i++) {
+        if (frames.length) frames.shift()();
+        await flush();
+    }
+    assert.ok(settled, 'cleanup must finish after a bounded number of UI frames');
+    await pending;
+}
+
+for (const [kind, extra] of Object.entries(contentExamples)) {
+    test(`${kind}-only responses survive automatic and manual cleanup`, async () => {
+        for (const withSwipes of [false, true]) {
+            const message = withSwipes ? swipeMessage(['']) : { is_user: false, mes: '' };
+            message.extra = structuredClone(extra);
+            const before = structuredClone(message);
+            const h = setup({ chat: [{ is_user: true, mes: 'Hi' }, message] });
+            h.run('onCharacterMessageRendered(1)');
+            await h.fire();
+            await h.run('processLastMessageLocked(true)');
+            assert.deepEqual(h.deletions, []);
+            assert.deepEqual(message, before);
+        }
+    });
+
+    test(`historical ${kind}-only swipe survives while a truly empty swipe is removed`, async () => {
+        const message = swipeMessage(['Keep', '', '']);
+        message.swipe_info[1].extra = structuredClone(extra);
+        const savedInfo = message.swipe_info[1];
+        const h = setup({ chat: [{ is_user: true, mes: 'Hi' }, message] });
+        await h.run('processLastMessageLocked(true)');
+        assert.deepEqual(h.deletions, [{ id: 1, swipeIndex: 2 }]);
+        assert.deepEqual(message.swipes, ['Keep', '']);
+        assert.equal(message.swipe_info[1], savedInfo);
+    });
+}
+
+test('an unstored visible response is preserved even when swipe_id is out of range', async () => {
+    const message = swipeMessage(['']);
+    Object.assign(message, { mes: 'A real new reply', swipe_id: 1 });
+    const h = setup({ chat: [{ is_user: true, mes: 'Hi' }, message] });
+    await h.run('processLastMessageLocked(true)');
+    assert.deepEqual(h.deletions, []);
+    assert.equal(message.mes, 'A real new reply');
+});
+
+for (const isUser of [true, false]) {
+    for (const replaceArray of [true, false]) {
+        test(`switching chats during cleanup preserves the new ${isUser ? 'user' : 'AI'} message (replace array: ${replaceArray})`, async () => {
+            const frames = [];
+            const original = swipeMessage();
+            const h = setup({ chat: [{ is_user: true, mes: 'Hi' }, original], animationFrames: frames });
+            const rendered = [];
+            h.context.updateMessageBlock = (...args) => rendered.push(args);
+            const pending = h.run('processLastMessageLocked(true)');
+            await flush();
+            assert.equal(frames.length, 1, 'pause at the actual animation-frame boundary');
+            const replacement = swipeMessage(['New A', 'New B']);
+            replacement.is_user = isUser;
+            const before = structuredClone(replacement);
+            const nextChat = [{ is_user: true, mes: 'New chat' }, replacement];
+            if (replaceArray) h.context.chat = nextChat;
+            else h.context.chat.splice(0, h.context.chat.length, ...nextChat);
+            h.context.chatId = 'different';
+            h.run('onChatChangedForExtension()');
+            await finishCleanup(pending, frames);
+            assert.deepEqual(replacement, before);
+            assert.deepEqual(h.deletions, [{ id: 1, swipeIndex: 2 }]);
+            assert.deepEqual(rendered, [], 'do not render the old message into the new chat');
+        });
+    }
+}
+
+test('message indexes are resolved again after another message is inserted', async () => {
+    const frames = [];
+    const original = swipeMessage();
+    const h = setup({ chat: [{ is_user: true, mes: 'Hi' }, original], animationFrames: frames });
+    const rendered = [];
+    h.context.updateMessageBlock = index => rendered.push(index);
+    const pending = h.run('processLastMessageLocked(true)');
+    await flush();
+    const inserted = swipeMessage(['Valid A', 'Valid B']);
+    inserted.is_user = true;
+    const before = structuredClone(inserted);
+    h.context.chat.splice(1, 0, inserted);
+    await finishCleanup(pending, frames);
+    assert.deepEqual(inserted, before);
+    assert.deepEqual(original.swipes, ['Keep']);
+    assert.deepEqual(h.deletions, [{ id: 1, swipeIndex: 2 }, { id: 2, swipeIndex: 1 }]);
+    assert.ok(rendered.every(index => index === 2));
+});
+
+for (const change of ['text', 'media', 'swipe order', 'role', 'visible text']) {
+    test(`cleanup stops when ${change} changes during its UI wait`, async () => {
+        const frames = [];
+        const original = swipeMessage();
+        const h = setup({ chat: [{ is_user: true, mes: 'Hi' }, original], animationFrames: frames });
+        const rendered = [];
+        h.context.updateMessageBlock = (...args) => rendered.push(args);
+        const pending = h.run('processLastMessageLocked(true)');
+        await flush();
+        if (change === 'text') original.swipes[1] = 'Now a valid reply';
+        if (change === 'media') original.swipe_info[1].extra = contentExamples.image;
+        if (change === 'swipe order') original.swipes.unshift('Inserted valid reply');
+        if (change === 'role') original.is_user = true;
+        if (change === 'visible text') original.mes = 'Edited visible text';
+        const before = structuredClone(original);
+        await finishCleanup(pending, frames);
+        assert.deepEqual(original, before);
+        assert.deepEqual(h.deletions, [{ id: 1, swipeIndex: 2 }]);
+        assert.deepEqual(rendered, []);
+    });
+}
+
+for (const action of ['onChatChangedForExtension()', "onGenerationStarted('normal')", 'cleanupExtension()']) {
+    test(`${action} cancels an already running cleanup`, async () => {
+        const frames = [];
+        const message = swipeMessage();
+        const h = setup({ chat: [{ is_user: true, mes: 'Hi' }, message], animationFrames: frames });
+        h.context.eventSource = { removeListener() {} };
+        h.context.event_types = {};
+        const pending = h.run('processLastMessageLocked(true)');
+        await flush();
+        h.run(action);
+        await finishCleanup(pending, frames);
+        assert.deepEqual(h.deletions, [{ id: 1, swipeIndex: 2 }]);
+    });
+}
+
+for (const isSystem of [false, true]) {
+    test(`cleanup never deletes ${isSystem ? 'system' : 'user'} messages or their retained swipes`, async () => {
+        const message = swipeMessage(['', '']);
+        message.is_user = !isSystem;
+        message.is_system = isSystem;
+        const before = structuredClone(message);
+        const h = setup({ chat: [{ is_user: true, mes: 'Hi' }, message] });
+        h.run('onCharacterMessageRendered(1)');
+        if (h.timers.size) await h.fire();
+        await h.run('processLastMessageLocked(true)');
+        await h.run('deleteLastMessage()');
+        assert.deepEqual(h.deletions, []);
+        assert.deepEqual(message, before);
+    });
+}
+
+test('a role change while the deletion API is finishing prevents further repair or deletion', async () => {
+    const message = swipeMessage();
+    const h = setup({ chat: [{ is_user: true, mes: 'Hi' }, message] });
+    const deleteMessage = h.context.deleteMessage;
+    h.context.deleteMessage = async (...args) => {
+        await deleteMessage(...args);
+        message.is_user = true;
+        message.mes = 'A legitimate user edit';
+    };
+    await h.run('processLastMessageLocked(true)');
+    assert.deepEqual(h.deletions, [{ id: 1, swipeIndex: 2 }]);
+    assert.equal(message.mes, 'A legitimate user edit');
+});
+
+for (const kind of ['media', 'reasoning', 'historical swipe']) {
+    test(`regenerate retry preserves ${kind} content even with automatic deletion disabled`, async () => {
+        const message = swipeMessage(['']);
+        if (kind === 'historical swipe') message.swipes.push('Saved valid response');
+        else message.extra = kind === 'media' ? contentExamples.image : contentExamples.reasoning;
+        const h = setup({ chat: [{ is_user: true, mes: 'Hi' }, message] });
+        h.context.extensionSettings['empty-response-cleaner'].autoDelete = false;
+        h.run("onGenerationStarted('regenerate')");
+        await h.request();
+        await h.fire();
+        assert.deepEqual(h.calls, []);
+    });
+}
+
+test('a newly arrived user message cancels a pending swipe retry without modifying its swipes', async () => {
+    const h = setup({ chat: [{ is_user: false, mes: 'Old response' }] });
+    h.run("onGenerationStarted('swipe')");
+    await h.request();
+    const user = { is_user: true, mes: 'My next message', swipes: ['My next message'], swipe_id: 0 };
+    const before = structuredClone(user);
+    h.context.chat.push(user);
+    await h.fire();
+    assert.deepEqual(h.calls, []);
+    assert.deepEqual(user, before);
+});
+
+test('new media arriving during a retry delay cancels that retry', async () => {
+    const h = setup();
+    h.run("onGenerationStarted('regenerate')");
+    await h.request();
+    const reply = { is_user: false, mes: '', extra: contentExamples.image };
+    h.context.chat.push(reply);
+    await h.fire();
+    assert.deepEqual(h.calls, []);
+    assert.equal(h.context.chat.at(-1), reply);
+});
+
+for (const busy of ['generating', 'swiping']) {
+    test(`an in-progress ${busy} placeholder is never deleted by cleanup`, async () => {
+        const message = swipeMessage(['']);
+        const h = setup({ chat: [{ is_user: true, mes: 'Hi' }, message], document: { body: { dataset: { [busy]: 'true' } } } });
+        h.run('onCharacterMessageRendered(1)');
+        await h.fire();
+        await h.run('processLastMessageLocked(true)');
+        assert.deepEqual(h.deletions, []);
+        assert.equal(h.context.chat.at(-1), message);
+    });
+}
+
+test('invalid render indexes never fall back to deleting a different AI message', async () => {
+    const message = swipeMessage(['']);
+    const h = setup({ chat: [{ is_user: true, mes: 'Hi' }, message] });
+    h.run('onCharacterMessageRendered(-1); onCharacterMessageRendered(undefined)');
+    assert.equal(h.timers.size, 0);
+    assert.deepEqual(h.deletions, []);
+});
+
+test('genuinely empty AI messages are still removed', async () => {
+    const message = swipeMessage(['', ' \n ']);
+    const h = setup({ chat: [{ is_user: true, mes: 'Hi' }, message] });
+    await h.run('processLastMessageLocked(true)');
+    assert.deepEqual(h.deletions, [{ id: 1, swipeIndex: undefined }]);
+    assert.equal(h.context.chat.length, 1);
+});
+
+test('the explicit delete button still removes a valid AI message without touching the trailing user message', async () => {
+    const ai = swipeMessage(['Valid answer']);
+    const user = { is_user: true, mes: 'My next message' };
+    const h = setup({ chat: [{ is_user: true, mes: 'Hi' }, ai, user] });
+    await h.run('deleteLastMessage()');
+    assert.deepEqual(h.deletions, [{ id: 1, swipeIndex: undefined }]);
+    assert.equal(h.context.chat.at(-1), user);
 });

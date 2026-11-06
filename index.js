@@ -10,6 +10,7 @@ const defaultSettings = {
 };
 
 let isProcessing = false;
+let cleanupEpoch = 0;
 let lastScheduledCleanup = {
     messageIndex: null,
     at: 0,
@@ -64,7 +65,72 @@ function loadSettings() {
  * @returns {boolean} - True if the swipe is empty
  */
 function isSwipeEmpty(swipe) {
-    return !swipe || swipe.trim() === '';
+    // Unexpected non-string content is preserved rather than treated as empty.
+    return swipe === undefined || swipe === null || (typeof swipe === 'string' && swipe.trim() === '');
+}
+
+const CONTENT_EXTRA_KEYS = ['media', 'files', 'image', 'file', 'audio', 'video', 'reasoning', 'tool_invocations'];
+
+function hasContentValue(value) {
+    return Array.isArray(value) ? value.length > 0 : value !== false && !isSwipeEmpty(value);
+}
+
+function hasExtraContent(extra) {
+    return CONTENT_EXTRA_KEYS.some(key => hasContentValue(extra?.[key]));
+}
+
+function getExtraContentState(extra) {
+    try {
+        return JSON.stringify(Object.fromEntries(CONTENT_EXTRA_KEYS
+            .filter(key => hasContentValue(extra?.[key])).map(key => [key, extra[key]])));
+    } catch {
+        return null;
+    }
+}
+
+function hasActiveContent(message) {
+    const activeId = Number.isInteger(message?.swipe_id) ? message.swipe_id : 0;
+    return Boolean(message && (!isSwipeEmpty(message.mes) || hasExtraContent(message.extra)
+        || hasExtraContent(message.swipe_info?.[activeId]?.extra)));
+}
+
+function hasMessageContent(message) {
+    return hasActiveContent(message) || (Array.isArray(message?.swipes) && message.swipes.some((text, index) =>
+        !isSwipeEmpty(text) || hasExtraContent(message.swipe_info?.[index]?.extra)));
+}
+
+function isMessageSwipeEmpty(message, index) {
+    const activeId = Number.isInteger(message.swipe_id) ? message.swipe_id : 0;
+    return isSwipeEmpty(message.swipes[index]) && !hasExtraContent(message.swipe_info?.[index]?.extra)
+        && (index !== activeId || !hasActiveContent(message));
+}
+
+// Persisted message state also catches in-place metadata edits across an await.
+// If an extension supplies unserializable state, skip cleanup conservatively.
+function getMessageState(message) {
+    try {
+        return JSON.stringify({
+            is_user: message.is_user, is_system: message.is_system, mes: message.mes,
+            swipe_id: message.swipe_id, swipes: message.swipes,
+            extra: message.extra, swipe_info: message.swipe_info,
+        });
+    } catch {
+        return null;
+    }
+}
+
+function captureMessageTarget(message, isManual = false) {
+    return { message, chatKey: getCurrentChatKey(), epoch: cleanupEpoch, isManual };
+}
+
+function resolveMessageTarget(target) {
+    const { chat } = SillyTavern.getContext();
+    if (target.epoch !== cleanupEpoch || target.chatKey !== getCurrentChatKey()
+        || target.message?.is_user !== false || target.message.is_system === true
+        || (!target.isManual && (!getSettings()?.enabled || !getSettings()?.autoDelete))) {
+        return -1;
+    }
+    return chat?.indexOf(target.message) ?? -1;
 }
 
 const DEBUG = false;
@@ -198,6 +264,7 @@ function onGenerationStarted(type, options = {}, dryRun = false) {
     // A new foreground generation supersedes stale generation contexts.
     // If the user started it manually, it also starts a fresh retry budget.
     if (normalizedType !== 'quiet') {
+        cleanupEpoch++;
         foregroundGenerationId = generation.id;
         pendingSwipeGeneration = null;
         emptySwipeCompletion = null;
@@ -206,7 +273,8 @@ function onGenerationStarted(type, options = {}, dryRun = false) {
             swipeCompletionTimerId = null;
         }
         generationEpoch++;
-        if (!retryState.launching || retryState.launchedGenerationId !== null) {
+        if (!retryState.launching || (retryState.launchedGenerationId !== null
+            && (!SillyTavern.getContext().groupId || retryState.scheduledForGenerationId !== null))) {
             cancelPendingRetry(true);
             retryState.chatKey = generation.chatKey;
         } else {
@@ -240,12 +308,14 @@ function onGenerateAfterData(generateData, dryRun = false) {
 }
 
 function onGenerationStopped() {
+    cleanupEpoch++;
     generationStack = [];
     cancelPendingRetry(true);
     log('Generation stopped; pending API retry cancelled');
 }
 
 function onChatChangedForExtension() {
+    cleanupEpoch++;
     if (autoCleanupTimerId !== null) {
         clearTimeout(autoCleanupTimerId);
         autoCleanupTimerId = null;
@@ -660,6 +730,12 @@ function takeChatSnapshot() {
         chatLength: chat?.length ?? 0,
         lastMessage,
         lastMes: lastMessage?.mes ?? '',
+        lastIsUser: lastMessage?.is_user,
+        lastIsSystem: lastMessage?.is_system,
+        lastHasContent: hasMessageContent(lastMessage),
+        lastExtraState: getExtraContentState(lastMessage?.extra),
+        swipeExtraState: Array.isArray(lastMessage?.swipes)
+            ? JSON.stringify(Array.from(lastMessage.swipes, (_, i) => getExtraContentState(lastMessage.swipe_info?.[i]?.extra))) : null,
         swipeId: lastMessage?.swipe_id,
         swipeCount: Array.isArray(lastMessage?.swipes) ? lastMessage.swipes.length : 0,
         swipes: Array.isArray(lastMessage?.swipes) ? [...lastMessage.swipes] : null,
@@ -669,8 +745,14 @@ function takeChatSnapshot() {
 function isChatSnapshotUnchanged(snapshot) {
     const current = takeChatSnapshot();
     return current.chatLength === snapshot.chatLength
+        && current.lastExtraState !== null && snapshot.lastExtraState !== null
         && current.lastMessage === snapshot.lastMessage
         && current.lastMes === snapshot.lastMes
+        && current.lastIsUser === snapshot.lastIsUser
+        && current.lastIsSystem === snapshot.lastIsSystem
+        && current.lastHasContent === snapshot.lastHasContent
+        && current.lastExtraState === snapshot.lastExtraState
+        && current.swipeExtraState === snapshot.swipeExtraState
         && current.swipeId === snapshot.swipeId
         && current.swipeCount === snapshot.swipeCount
         && JSON.stringify(current.swipes) === JSON.stringify(snapshot.swipes);
@@ -689,6 +771,8 @@ function getFailedSwipeRollbackSnapshot(generation, snapshot) {
         ...snapshot,
         swipeId: snapshot.swipeCount - 1,
         lastMes: snapshot.swipes[snapshot.swipeCount - 1],
+        lastExtraState: snapshot.lastMessage.swipe_info?.[snapshot.swipeCount - 1]
+            ? getExtraContentState(snapshot.lastMessage.swipe_info[snapshot.swipeCount - 1].extra) : snapshot.lastExtraState,
     };
 }
 
@@ -706,12 +790,13 @@ function handleCompletedSwipe(messageIndex, type) {
     if (!generation || !isCurrentGeneration(generation)
         || (type !== undefined && type !== 'swipe')
         || chat?.[messageIndex] !== generation.swipeMessage
+        || generation.swipeMessage.is_user !== false || generation.swipeMessage.is_system === true
         || messageIndex !== chat.length - 1) {
         return false;
     }
 
     pendingSwipeGeneration = null;
-    if (!isSwipeEmpty(generation.swipeMessage.mes)) {
+    if (hasActiveContent(generation.swipeMessage)) {
         markSuccessfulGenerationRequest(generation, true);
         return false;
     }
@@ -745,14 +830,17 @@ function handleCompletedSwipe(messageIndex, type) {
         }
 
         const message = generation.swipeMessage;
+        if (message.is_user !== false || message.is_system === true || hasActiveContent(message)) {
+            cancelPendingRetry(true);
+            return;
+        }
         // Predict the official deletion API's resulting selection, so a user
         // changing swipes while asynchronous cleanup runs still cancels retry.
         const expectedSwipes = Array.isArray(message.swipes) ? [...message.swipes] : null;
         let expectedId = message.swipe_id;
         let expectedMes = message.mes;
         if (getSettings()?.autoDelete && expectedSwipes) {
-            for (let i = expectedSwipes.length - 1; i >= 0; i--) {
-                if (!isSwipeEmpty(expectedSwipes[i])) continue;
+            for (const i of cleanMessageSwipes(message).emptySwipeIndexes.reverse()) {
                 expectedSwipes.splice(i, 1);
                 if (i < expectedId) expectedId--;
                 else if (i === expectedId) expectedId = Math.min(i, expectedSwipes.length - 1);
@@ -792,10 +880,17 @@ function getRetryBlocker(snapshot, retryType) {
     const { chat } = SillyTavern.getContext();
     const lastMessage = chat?.[chat.length - 1];
 
-    // Only a non-empty AI message at the end of the chat is at risk.
-    if (!lastMessage || lastMessage.is_user === true || isSwipeEmpty(lastMessage.mes)) {
+    if (!lastMessage) {
         return null;
     }
+
+    if (lastMessage.is_user === true) {
+        return !isChatSnapshotUnchanged(snapshot) || ['swipe', 'continue'].includes(retryType)
+            ? 'reply-arrived' : null;
+    }
+
+    if (lastMessage.is_user !== false || lastMessage.is_system === true) return 'would-delete';
+    if (!hasMessageContent(lastMessage)) return null;
 
     if (!isChatSnapshotUnchanged(snapshot)) {
         return 'reply-arrived';
@@ -893,7 +988,7 @@ function scheduleGenerationRetry(generation, failure) {
             return;
         }
 
-        if (isGenerationInProgress()) {
+        if (isGenerationInProgress() || isProcessing) {
             idleWaitStartedAt ??= Date.now();
             if (Date.now() - idleWaitStartedAt >= RETRY_IDLE_MAX_WAIT_MS) {
                 log('API retry cancelled; generation still running', { generationId: generation.id });
@@ -932,6 +1027,7 @@ function scheduleGenerationRetry(generation, failure) {
         retryState.launching = true;
         retryState.launchedGenerationId = null;
         let swipeBeforeRetry = null;
+        let pendingSwipeState = null;
         try {
             log('Starting API retry', {
                 originalType: generation.type,
@@ -946,6 +1042,7 @@ function scheduleGenerationRetry(generation, failure) {
                     // saveReply writes at swipe_id. Always append, even after
                     // cleanup restored the visible selection to a valid reply.
                     message.swipe_id = message.swipes.length;
+                    pendingSwipeState = getMessageState(message);
                 }
             }
             await context.generate(retryType, copyRetryOptions(generation.options));
@@ -961,6 +1058,8 @@ function scheduleGenerationRetry(generation, failure) {
             if (foregroundGenerationId === (retryState.launchedGenerationId ?? generation.id)
                 && getCurrentChatKey() === generation.chatKey && swipeBeforeRetry
                 && message === swipeBeforeRetry.lastMessage
+                && message.is_user === false && message.is_system !== true
+                && pendingSwipeState !== null && getMessageState(message) === pendingSwipeState
                 && message.swipe_id === swipeBeforeRetry.swipeCount
                 && Array.isArray(message.swipes)
                 && message.swipes.length === swipeBeforeRetry.swipeCount) {
@@ -972,7 +1071,7 @@ function scheduleGenerationRetry(generation, failure) {
                 message.swipe_id = Math.min(swipeBeforeRetry.swipeId ?? 0, message.swipes.length - 1);
                 message.mes = message.swipes[message.swipe_id];
                 if (canRefreshSnapshot) retryState.snapshot = takeChatSnapshot();
-                await repairAndRerenderMessage(context.chat.length - 1);
+                await repairAndRerenderMessage(captureMessageTarget(message, true));
             }
         }
     };
@@ -1222,25 +1321,21 @@ async function waitForUiTick() {
 /**
  * Clamp swipe_id and force the visible message content to the active swipe,
  * then re-render only that message block.
- * @param {number} messageIndex
+ * @param {object} target
  * @returns {Promise<boolean>}
  */
-async function repairAndRerenderMessage(messageIndex) {
-    const { chat, updateMessageBlock, swipe } = SillyTavern.getContext();
-    const canRerender = typeof updateMessageBlock === 'function';
-
-    if (!chat || messageIndex < 0 || messageIndex >= chat.length) {
+async function repairAndRerenderMessage(target) {
+    let messageIndex = resolveMessageTarget(target);
+    if (messageIndex === -1) {
         return false;
     }
-
-    const message = chat[messageIndex];
-    if (!message || message.is_user === true) {
-        return false;
-    }
+    const message = target.message;
 
     if (Array.isArray(message.swipes) && message.swipes.length > 0) {
         const currentSwipeId = Number.isInteger(message.swipe_id) ? message.swipe_id : 0;
         const clampedSwipeId = Math.max(0, Math.min(currentSwipeId, message.swipes.length - 1));
+        // An out-of-range slot can belong to a newly arriving response.
+        if (clampedSwipeId !== currentSwipeId && hasActiveContent(message)) return false;
         message.swipe_id = clampedSwipeId;
 
         const activeSwipe = message.swipes[clampedSwipeId];
@@ -1248,12 +1343,20 @@ async function repairAndRerenderMessage(messageIndex) {
             // ST's saveReply renders a new swipe before storing it in swipes[];
             // keep the visible text instead of blanking it.
             message.swipes[clampedSwipeId] = message.mes;
-        } else {
+        } else if (isSwipeEmpty(message.mes)) {
             message.mes = typeof activeSwipe === 'string' ? activeSwipe : String(activeSwipe ?? '');
+        } else if (message.mes !== activeSwipe) {
+            return false; // Never overwrite a concurrent visible-text edit.
         }
     }
 
+    const state = getMessageState(message);
+    if (state === null) return false;
     await waitForUiTick();
+    messageIndex = resolveMessageTarget(target);
+    if (messageIndex === -1 || getMessageState(message) !== state) return false;
+    const { updateMessageBlock, swipe } = SillyTavern.getContext();
+    const canRerender = typeof updateMessageBlock === 'function';
 
     if (canRerender) {
         try {
@@ -1263,7 +1366,7 @@ async function repairAndRerenderMessage(messageIndex) {
         }
     }
 
-    if (swipe && typeof swipe.refresh === 'function') {
+    if (resolveMessageTarget(target) !== -1 && swipe && typeof swipe.refresh === 'function') {
         try {
             swipe.refresh(true, false);
         } catch {
@@ -1282,7 +1385,7 @@ async function repairAndRerenderMessage(messageIndex) {
         });
     }
 
-    return canRerender;
+    return resolveMessageTarget(target) !== -1 && getMessageState(message) === state;
 }
 
 /**
@@ -1297,11 +1400,21 @@ function getDeleteMessageApi() {
 /**
  * Delete a whole message or a single swipe via official ST API.
  * Returns false if API is unavailable or the operation fails.
- * @param {number} messageIndex
+ * @param {object} target
  * @param {number|undefined} swipeIndex
+ * @param {boolean} onlyEmpty - False only for the explicit manual delete button
  * @returns {Promise<boolean>}
  */
-async function deleteViaApi(messageIndex, swipeIndex = undefined) {
+async function deleteViaApi(target, swipeIndex = undefined, onlyEmpty = true) {
+    const messageIndex = resolveMessageTarget(target);
+    if (messageIndex === -1) return false;
+    const message = target.message;
+    if (onlyEmpty) {
+        if (isGenerationInProgress()) return false;
+        const analysis = cleanMessageSwipes(message);
+        if (swipeIndex === undefined ? !analysis.messageDeleted
+            : !analysis.emptySwipeIndexes.includes(swipeIndex)) return false;
+    }
     const deleteMessage = getDeleteMessageApi();
     if (!deleteMessage) {
         toastr.warning('Cleanup skipped: compatible delete API not available', 'Empty Response Cleaner');
@@ -1332,10 +1445,12 @@ function cleanMessageSwipes(message) {
         modified: false,
     };
 
+    if (!message || message.is_user !== false || message.is_system === true) return result;
+
     // Check if message has swipes array
-    if (!message.swipes || !Array.isArray(message.swipes)) {
+    if (!Array.isArray(message.swipes) || message.swipes.length === 0) {
         // If no swipes array, check the main 'mes' property
-        if (isSwipeEmpty(message.mes)) {
+        if (!hasMessageContent(message)) {
             result.messageDeleted = true;
             result.modified = true;
         }
@@ -1345,14 +1460,11 @@ function cleanMessageSwipes(message) {
     // ST's saveReply emits CHARACTER_MESSAGE_RENDERED for a new swipe before it
     // copies mes into swipes[swipe_id]. Visible text means the swipe isn't empty.
     const activeSwipeId = Number.isInteger(message.swipe_id) ? message.swipe_id : 0;
-    const hasVisibleText = !isSwipeEmpty(message.mes);
+    // With no stored active slot, cleanup must not clamp away visible content.
+    if ((activeSwipeId < 0 || activeSwipeId >= message.swipes.length) && hasActiveContent(message)) return result;
 
     for (let i = 0; i < message.swipes.length; i++) {
-        if (i === activeSwipeId && hasVisibleText) {
-            continue;
-        }
-
-        if (isSwipeEmpty(message.swipes[i])) {
+        if (isMessageSwipeEmpty(message, i)) {
             result.emptySwipeIndexes.push(i);
         }
     }
@@ -1367,7 +1479,7 @@ function cleanMessageSwipes(message) {
     result.modified = true;
 
     // If all swipes are empty, mark for full message deletion
-    if (result.removedSwipes === message.swipes.length) {
+    if (result.removedSwipes === message.swipes.length && !hasMessageContent(message)) {
         result.messageDeleted = true;
     }
 
@@ -1402,7 +1514,7 @@ async function processLastMessage(isManual = false, targetMessage = null) {
     } else {
         // Find the last AI message
         for (let i = chat.length - 1; i >= 0; i--) {
-            if (chat[i].is_user === false) {
+            if (chat[i].is_user === false && chat[i].is_system !== true) {
                 messageIndex = i;
                 break;
             }
@@ -1418,11 +1530,13 @@ async function processLastMessage(isManual = false, targetMessage = null) {
     }
 
     // When auto-delete is disabled, skip all automatic cleanup/deletion.
-    if (!isManual && !getSettings()?.autoDelete) {
+    if (!isManual && (!getSettings()?.enabled || !getSettings()?.autoDelete)) {
         return false;
     }
 
     const message = chat[messageIndex];
+    const target = captureMessageTarget(message, isManual);
+    if (resolveMessageTarget(target) === -1 || getMessageState(message) === null) return false;
     const result = cleanMessageSwipes(message);
 
     if (!result.modified) {
@@ -1442,7 +1556,7 @@ async function processLastMessage(isManual = false, targetMessage = null) {
             return false;
         }
 
-        const deleted = await deleteViaApi(messageIndex);
+        const deleted = await deleteViaApi(target);
         if (!deleted) {
             return false;
         }
@@ -1454,10 +1568,17 @@ async function processLastMessage(isManual = false, targetMessage = null) {
 
     let removedSwipes = 0;
     const emptyIndexesDescending = [...result.emptySwipeIndexes].sort((a, b) => b - a);
+    let expectedState = getMessageState(message);
 
     // Delete each empty swipe through API so ST emits MESSAGE_SWIPE_DELETED.
     for (const swipeIndex of emptyIndexesDescending) {
-        const deleted = await deleteViaApi(messageIndex, swipeIndex);
+        messageIndex = resolveMessageTarget(target);
+        if (messageIndex === -1 || expectedState === null || getMessageState(message) !== expectedState) break;
+        // The core API mutates synchronously, then awaits its event listeners.
+        // Verify its expected result before repairing or continuing cleanup.
+        const expectedSwipes = [...message.swipes];
+        expectedSwipes.splice(swipeIndex, 1);
+        const deleted = await deleteViaApi(target, swipeIndex);
         if (deleted) {
             removedSwipes++;
             log('Deleted empty swipe via deleteMessage API', {
@@ -1466,7 +1587,10 @@ async function processLastMessage(isManual = false, targetMessage = null) {
             });
 
             // Keep UI in sync immediately after each deletion.
-            await repairAndRerenderMessage(messageIndex);
+            if (resolveMessageTarget(target) === -1
+                || JSON.stringify(message.swipes) !== JSON.stringify(expectedSwipes)) break;
+            if (!await repairAndRerenderMessage(target)) break;
+            expectedState = getMessageState(message);
         }
     }
 
@@ -1506,6 +1630,7 @@ async function processLastMessageLocked(isManual = false, targetMessage = null) 
  * Safe to call multiple times.
  */
 function cleanupExtension() {
+    cleanupEpoch++;
     if (autoCleanupTimerId !== null) {
         clearTimeout(autoCleanupTimerId);
         autoCleanupTimerId = null;
@@ -1576,18 +1701,26 @@ function scheduleAutoCleanup(messageIndex) {
     // Tie the run to the rendered message itself; indexes can shift before the timer fires.
     const { chat } = SillyTavern.getContext();
     const targetMessage = messageIndex >= 0 ? (chat?.[messageIndex] ?? null) : null;
+    if (!targetMessage) return;
+    const target = captureMessageTarget(targetMessage);
 
     // Cancel any previously pending timer before scheduling a new one
     if (autoCleanupTimerId !== null) {
         clearTimeout(autoCleanupTimerId);
     }
 
-    autoCleanupTimerId = setTimeout(() => {
+    const deadline = Date.now() + 30000;
+    const attempt = async () => {
         autoCleanupTimerId = null;
-        processLastMessageLocked(false, targetMessage).catch((error) => {
-            console.warn(`[${extensionName}] Auto-clean failed`, error);
-        });
-    }, 50);
+        if (resolveMessageTarget(target) === -1) return;
+        if (isProcessing || isGenerationInProgress()) {
+            if (Date.now() < deadline) autoCleanupTimerId = setTimeout(attempt, 100);
+            return;
+        }
+        try { await processLastMessageLocked(false, targetMessage); }
+        catch (error) { console.warn(`[${extensionName}] Auto-clean failed`, error); }
+    };
+    autoCleanupTimerId = setTimeout(attempt, 50);
 }
 
 /**
@@ -1608,15 +1741,14 @@ function onCharacterMessageRendered(messageIndex, type) {
 
     // Validate message index
     if (typeof messageIndex !== 'number' || messageIndex < 0 || messageIndex >= chat.length) {
-        // If messageIndex is not valid, just process the last message.
-        scheduleAutoCleanup(-1);
+        // An unidentifiable event must never authorize deleting another message.
         return;
     }
 
     const message = chat[messageIndex];
 
     // Only process AI messages
-    if (message.is_user === true) {
+    if (message.is_user !== false || message.is_system === true) {
         return;
     }
 
@@ -1723,7 +1855,7 @@ async function deleteLastMessage() {
     // Find the last AI message
     let lastAiMessageIndex = -1;
     for (let i = chat.length - 1; i >= 0; i--) {
-        if (chat[i].is_user === false) {
+        if (chat[i].is_user === false && chat[i].is_system !== true) {
             lastAiMessageIndex = i;
             break;
         }
@@ -1739,7 +1871,8 @@ async function deleteLastMessage() {
         return false;
     }
 
-    const deleted = await deleteViaApi(lastAiMessageIndex);
+    const target = captureMessageTarget(chat[lastAiMessageIndex], true);
+    const deleted = await deleteViaApi(target, undefined, false);
     if (!deleted) {
         return false;
     }
